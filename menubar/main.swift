@@ -36,7 +36,6 @@ final class Controller: NSObject, NSApplicationDelegate {
                               accessibilityDescription: "Now Playing")
             img?.isTemplate = true
             b.image = img
-            b.imagePosition = .imageLeading
             // With neither image nor title the button has zero width.
             if img == nil { b.title = "♪" }
         }
@@ -157,11 +156,13 @@ final class Controller: NSObject, NSApplicationDelegate {
         // switchable off entirely. The full track is in the menu.
         if !showTitle || lastTitle.isEmpty {
             b.title = ""
+            b.imagePosition = b.image == nil ? .noImage : .imageOnly
             return
         }
         var s = lastTitle
         if s.count > 18 { s = String(s.prefix(17)).trimmingCharacters(in: .whitespaces) + "…" }
         b.title = " " + s
+        b.imagePosition = b.image == nil ? .noImage : .imageLeading
     }
 
     // MARK: - menu

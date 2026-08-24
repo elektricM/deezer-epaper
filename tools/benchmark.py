@@ -23,7 +23,12 @@ flat    share of DETAILED source regions that came out as a flat 5x5 patch.
         Restricted to places the source itself varies, because a cover with a
         genuinely solid black background is not posterised - counting those
         made a near-black cover read as 74% flat and swamped every comparison.
-dE      mean CIEDE2000 after blur. Overall accuracy; weakest of the four,
+detail  survival of light, chromatic detail - a pale cyan logo on a warm
+        background, say. Measured as retained edge energy where the source is
+        both chromatic and has structure. The pure primaries are very dark
+        (blue is luma 29), so a pale saturated feature can match to white and
+        disappear entirely; nothing else here notices that.
+dE      mean CIEDE2000 after blur. Overall accuracy; weakest of the five,
         because it rewards flat patches of the locally correct average.
 
     python3 tools/benchmark.py --covers covers/ --sweep saturate
@@ -41,6 +46,7 @@ SIM = panel.PAL_MUTED
 BLUR = 1.0
 CHROMA_FLOOR = 12.0          # below this the source has no meaningful hue
 DETAIL_FLOOR = 6.0           # local luma std below this and the source is flat too
+EDGE_PCT = 75.0              # edges above this percentile count as "structure"
 
 BASELINE = dict(method="floyd", blend=0.0, brightness=1.0, contrast=1.0,
                 saturate=1.0, neutral=0.0, black_point=0.0, weight=1.0)
@@ -106,12 +112,28 @@ def metrics(src, idx):
         for dx in range(-r, r + 1):
             same &= (idx[r + dy:h - r + dy, r + dx:w - r + dx] == cc)
 
+    # Does chromatic structure survive - a pale cyan logo on a warm ground?
+    #
+    # Measured on the BLURRED a*/b* channels, not on edge energy: dithering adds
+    # edges everywhere, so an edge-energy ratio measures speckle and rises even
+    # as the feature vanishes. Correlating the colour itself against the source
+    # asks the right question - is this region still a different colour from its
+    # surroundings, the way it was?
+    sel = (ca > CHROMA_FLOOR) & (np.abs(a[..., 0] - a[..., 0].mean()) > 0)
+    if sel.sum() > 200:
+        sa = np.stack([a[..., 1][sel], a[..., 2][sel]])
+        sb = np.stack([b[..., 1][sel], b[..., 2][sel]])
+        cs = [np.corrcoef(sa[i], sb[i])[0, 1] for i in (0, 1)]
+        detail = float(np.nanmean(cs))
+    else:
+        detail = float("nan")
+
     # Only where the source has something to lose.
     lum = (src * panel.LUMA).sum(-1)
     win = np.lib.stride_tricks.sliding_window_view(lum, (2 * r + 1, 2 * r + 1))
     detailed = win.std(axis=(-2, -1)) > DETAIL_FLOOR
     flat = float(same[detailed].mean()) if detailed.sum() > 100 else 0.0
-    return dict(hue=hue, chroma=chroma, flat=flat, de=de)
+    return dict(hue=hue, chroma=chroma, flat=flat, detail=detail, de=de)
 
 
 def load_covers(path, size=280):
