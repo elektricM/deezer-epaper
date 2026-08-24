@@ -6,7 +6,9 @@ WiFi and draws it. No cable, no account, no API key.
 
 ![Panel frame](docs/img/frame.png)
 
-Source on the left, what the panel prints on the right:
+A synthetic hue sweep, source on the left and the panel's rendering on the
+right. Six inks and a 30:1 contrast ratio, so this is roughly the honest limit -
+note the magenta and cyan bands, which are the hardest for the palette to reach:
 
 ![Source and dithered result](docs/img/compare.png)
 
