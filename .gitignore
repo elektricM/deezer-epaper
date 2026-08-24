@@ -1,0 +1,17 @@
+# Built by server/mradapter/build.sh on first run
+server/mradapter/*.dylib
+
+# Your WiFi credentials
+firmware/src/secrets.h
+
+# PlatformIO
+firmware/.pio/
+firmware/.last-refresh
+
+# Runtime state
+config.json
+__pycache__/
+*.pyc
+
+# Built app bundle
+*.app
