@@ -103,25 +103,91 @@ none by about chroma 60. At K=3, mid grey stops resolving to a colour while hot
 pink, orange, sky blue, skin and deep red all pick exactly the same inks as with
 no protection at all.
 
-## Palette blend: keep it low, and do not import the number
 
-Upstream reframe blends continuously between muted real-ink values and pure
-primaries, defaulting to 0.6 - an idea it takes from Pimoroni's Inky library.
-The parameterisation is right and better than choosing between fixed palettes.
-**The 0.6 is not transferable**: Inky is a 7-colour ACeP panel with different
-inks. Measured on Spectra 6 across seven covers, flat 5x5 patches by blend:
+## Measured settings reference
 
-| cover | 0.0 | 0.1 | 0.2 | 0.3 | 0.6 | 1.0 |
-|---|---|---|---|---|---|---|
-| SIAMES (magenta) | 0.0 % | 0.0 % | 0.0 % | 0.0 % | 26.0 % | 52.5 % |
-| RAM (near-black) | 5.6 % | 26.8 % | 57.6 % | 74.1 % | 75.5 % | 75.9 % |
-| Empire of the Sun | 2.2 % | 3.7 % | 4.8 % | 5.8 % | 8.3 % | 11.8 % |
-| Hot Pink | 0.1 % | 0.1 % | 0.1 % | 0.1 % | 1.0 % | 10.9 % |
+Produced by `tools/benchmark.py` over 11 covers spanning dark, bright, neutral,
+skin, and specific hues (cyan, magenta, orange, blue). Protocol: the simulation
+palette is held constant so only the matcher varies, one parameter is swept at a
+time from a documented baseline, and both the mean and the **worst cover** are
+reported - a mean over a varied set hides a single colour category failing
+completely, which is how several wrong conclusions were reached before this
+harness existed.
 
-Keep it **under 0.3**. At 0.6 with brightness and saturation applied, one magenta
-cover collapsed from a four-ink mix (red 60 %, white 24 %, blue 9 %, black 7 %)
-to **87 % flat red**. Dark covers collapse earliest, by about 0.2, because the
-muted black raises the floor and swallows the background.
+Hue error is the primary metric: chroma-weighted mean hue-angle error in CIELAB
+after an eye-model blur, measured only where the source has real chroma. It
+catches a cyan subject rendering as green, which neither mean dE nor
+coloured-ink share will.
+
+### Kernel
+
+| method | hue mean | hue worst | flat | chroma |
+|---|---|---|---|---|
+| jarvis | **20.7°** | **30.5°** | 1.2 % | 0.34 |
+| sierra | 20.9° | 36.4° | 0.5 % | 0.43 |
+| floyd | 21.0° | 36.8° | 0.5 % | 0.42 |
+| atkinson | 22.6° | 42.3° | 6.4 % | 0.30 |
+| bayer | 45.2° | 77.4° | 22.4 % | 0.26 |
+| nearest | 52.0° | 77.7° | 42.5 % | 0.33 |
+
+Jarvis wins on both mean and worst case. Atkinson's discarded quarter of the
+error costs hue accuracy and flattens more than it helps.
+
+### Palette blend
+
+| blend | hue mean | hue worst | flat mean | flat worst | chroma |
+|---|---|---|---|---|---|
+| 0.0 | 21.0° | 36.8° | 0.5 % | 3.8 % | 0.42 |
+| 0.2 | **17.6°** | **25.4°** | 0.9 % | 3.4 % | 0.56 |
+| 0.3 | 17.0° | 25.3° | 1.6 % | 7.3 % | 0.61 |
+| 0.4 | 16.7° | 25.0° | 2.6 % | 8.9 % | 0.64 |
+| 0.6 | 18.6° | 28.0° | 8.1 % | 23.0 % | 0.70 |
+| 1.0 | 20.4° | 33.8° | 13.7 % | 47.8 % | 0.86 |
+
+**0.2 to 0.3.** Hue error is worse in *both* directions from there: pure
+primaries are the worst setting of all on the hardest cover (36.8°), and past
+0.4 the inks sit close enough together that hue discrimination collapses - a
+cyan subject resolves to green at 0.6. Flat patches climb monotonically, so 0.2
+is the safer end of the range.
+
+### Saturation
+
+| saturate | hue mean | hue worst | flat | chroma |
+|---|---|---|---|---|
+| 0.8 | 21.5° | **36.3°** | 1.1 % | 0.35 |
+| 1.0 | 21.0° | 36.8° | 1.0 % | 0.42 |
+| 1.4 | 20.9° | 43.4° | 0.7 % | 0.56 |
+| 2.0 | 20.7° | 48.7° | 1.0 % | 0.69 |
+| 2.5 | **20.4°** | 50.7° | 1.6 % | 0.78 |
+
+The mean and the worst case point in opposite directions, and the worst case is
+the one that matters. Raising saturation improves most covers slightly while
+pushing specific hues outside the reachable gamut, where the residual cannot
+resolve and the diffusion settles on the wrong ink. A magenta cover goes from
+36.8° to 50.7°. Cyan is the other vulnerable hue: it needs high G and high B at
+once, blue and green average to a dark teal, and past about 1.8 the error runs
+away to green.
+
+### Brightness, contrast, black point
+
+All three leave hue roughly alone and trade flat patches. Worst-case hue prefers
+brightness 0.9 and contrast 0.85; both degrade above 1.15. Black point barely
+touches hue and is worth using only on covers with large near-black areas, where
+it stops the diffusion scattering bright dots.
+
+### Neutral protection
+
+**A no-op below about blend 0.4.** With pure primaries a mid grey sits nearly
+equidistant from all six inks, so nothing competes with black and white for it
+and the penalty never fires - the sweep is identical from 0 to 8. It only
+matters once the blend brings a chromatic ink close to the greys.
+
+### Recommended, and its limits
+
+`jarvis`, blend 0.25, everything else off: hue 17.5° mean / 25.4° worst against
+21.0° / 36.8° for plain floyd at blend 0. But it is better on 6 of 11 covers and
+worse on 5, so it is a better default, not a universal answer. Covers genuinely
+differ; that is what the tuning page is for.
 
 ## Metrics disagree with eyes here, and the eyes are right
 

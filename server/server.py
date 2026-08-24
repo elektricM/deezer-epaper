@@ -34,9 +34,11 @@ _art = {}          # track key -> enriched Deezer data, so we hit the API once
 # Every "correction" this project accumulated - chroma weighting, gamut easing,
 # pre-saturation, the measured palette - was switched off again after seeing it
 # on the glass. Plain Floyd-Steinberg against the ideal palette won.
-_cfg = {"follow_any": False, "serve_lan": False, "method": "floyd",
+_cfg = {"follow_any": False, "serve_lan": False, "method": "jarvis",
         "saturate": 1.0, "contrast": 1.0, "chroma": 1.0, "gamut": 0.0,
-        # Everything off by default; tune per image from /tune.
+        # From tools/benchmark.py over 11 covers: jarvis wins on both mean and
+        # worst-case hue error, and blend 0.2-0.3 minimises it. Everything else
+        # off - brightness, contrast and saturation all degrade the worst cover.
         "neutral": 0.0, "black_point": 0.0, "brightness": 1.0,
         "palette": "ideal"}
 # Deezer keeps playing while minimised, so a momentary "no window"
@@ -996,12 +998,12 @@ with whatever pigment values are set below. Same code path as the real frame.</p
     muted real-ink measurement. Pure leaves a large residual everywhere so the
     diffusion keeps mixing and detail survives; muted puts colours where they
     truly land but collapses areas into flat patches.
-    <b>Measured here, keep it under about 0.3.</b> Past that, flat patches climb
-    steeply &mdash; one cover went 0% to 26% to 52% across 0.3/0.6/1.0, turning a
-    four-ink magenta field into solid red. Dark covers collapse earliest,
-    by about 0.2. Upstream reframe uses 0.6, but that figure comes from
-    Pimoroni&rsquo;s Inky, a 7-colour ACeP panel, and does not transfer.
-    Moving this rewrites the six values above, still hand-editable.</p>
+    <b>0.2 to 0.3.</b> Measured over 11 covers, hue error is worse in both
+    directions: pure primaries are the worst setting on the hardest cover, and
+    past 0.4 the inks sit close enough together that hue discrimination
+    collapses &mdash; a cyan subject resolves to green at 0.6. Flat patches climb
+    steadily, so 0.2 is the safer end. Moving this rewrites the six values
+    above, still hand-editable.</p>
     <div class="btns">
       <button data-preset="ideal">pure</button>
       <button data-preset="reframe">reframe 0.6</button>
@@ -1036,11 +1038,12 @@ with whatever pigment values are set below. Same code path as the real frame.</p
       <div class="head"><input type="checkbox" id="on_saturate">
         <label for="on_saturate">Saturation</label><span class="v" id="v_saturate"></span></div>
       <input type="range" id="saturate" min="0.4" max="4" step="0.05">
-      <p class="hint">Pushes colour towards the inks. Dark, low-chroma sources
-      often need a lot &mdash; 2 and above is reasonable on a moody cover.
-      Measured across nine covers, raising this increases the share of coloured
-      ink in nine cases out of ten, so push it until it looks right rather than
-      stopping at some safe number.</p>
+      <p class="hint">Pushes colour towards the inks. Helps most covers a
+      little and hurts a few badly: it drives specific hues outside the
+      reachable gamut, where the residual cannot resolve. Magenta and cyan are
+      the vulnerable ones &mdash; cyan needs high green and high blue at once, and
+      past about 1.8 it collapses to green. Worth raising on a dark, low-chroma
+      cover; check saturated ones before committing.</p>
     </div>
     <div class="stage" data-k="neutral">
       <div class="head"><input type="checkbox" id="on_neutral">
@@ -1088,7 +1091,7 @@ with whatever pigment values are set below. Same code path as the real frame.</p
 <script>
 const SL=['brightness','contrast','saturate','neutral','black_point','chroma','gamut'];
 const OFF={brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,chroma:1,gamut:0};      // value that disables each stage
-const D={method:'floyd',brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,chroma:1,gamut:1};
+const D={method:'jarvis',brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,chroma:1,gamut:1};
 const $=i=>document.getElementById(i);
 let cur={...D}, on={brightness:false,contrast:false,saturate:false,neutral:false,black_point:false,chroma:false,gamut:false};
 let pig=[], names=[], presets={}, timer=null;
@@ -1156,7 +1159,7 @@ function applyBlend(t){
 $('blend').addEventListener('input',e=>applyBlend(parseFloat(e.target.value)));
 
 $('reset').onclick=()=>{ cur={...D}; on={brightness:false,contrast:false,saturate:false,neutral:false,black_point:false,chroma:false,gamut:false};
-  $('blend').value=0.1; applyBlend(0.1); paint(); };
+  $('blend').value=0.25; applyBlend(0.25); paint(); };
 $('apply').onclick=async()=>{
   $('apply').disabled=true; $('state').textContent='saving…';
   const body={method:cur.method,pal:palParam()};

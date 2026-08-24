@@ -113,3 +113,26 @@ on the device playing it, which is why this reads the Mac.
 ## Licence
 
 MIT.
+
+## Measuring it
+
+`tools/benchmark.py` characterises each setting over a fixed cover set. The
+protocol matters more than the numbers: the simulation palette is held constant
+so only the matcher varies, one parameter is swept at a time, and both the mean
+and the **worst cover** are reported.
+
+```sh
+python3 tools/benchmark.py --covers covers --all
+python3 tools/benchmark.py --covers covers --sweep blend
+```
+
+The primary metric is hue error - chroma-weighted hue-angle error in CIELAB
+after an eye-model blur, measured only where the source has real chroma. Mean dE
+and coloured-ink share both miss the failure that matters most here: a cyan
+subject rendering as solid green.
+
+Reporting the worst cover rather than the mean is not a detail. A mean over a
+varied set hides one colour category failing completely - CIEDE2000 matching
+scored fine on average while turning every magenta field blue.
+
+Results are in [docs/epaper-rendering.md](docs/epaper-rendering.md).
