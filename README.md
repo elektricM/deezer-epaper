@@ -4,14 +4,6 @@ Shows whatever I'm playing on Deezer on a Waveshare 4inch E Ink Spectra 6 panel.
 The Mac figures out the track and renders a frame; the panel fetches it over
 WiFi and draws it. No cable, no account, no API key.
 
-![Panel frame](docs/img/frame.png)
-
-A synthetic hue sweep, source on the left and the panel's rendering on the
-right. Six inks and a 30:1 contrast ratio, so this is roughly the honest limit -
-note the magenta and cyan bands, which are the hardest for the palette to reach:
-
-![Source and dithered result](docs/img/compare.png)
-
 ## How it works
 
 ```
