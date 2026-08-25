@@ -116,3 +116,28 @@ clips is a one-line change and does nothing at brightness = contrast = 1.0.
 Related: at saturate 2.2 the per-channel clip means the control has stopped
 behaving like saturation and is closer to a posterise onto the RGB cube's
 surface. That may be *why* it works with a near-primary palette.
+
+## Rebuilding the app revokes Accessibility
+
+macOS ties an Accessibility grant to the app's code-signature hash. This app is
+ad-hoc signed - there is no Developer ID on the machine - so **every rebuild of
+the menu bar app produces a new hash and silently drops the permission**.
+
+That matters more than it sounds. When another app holds the now-playing slot
+(a browser playing a video is enough), reading Deezer's window title is the
+only way to see what Deezer is playing, and that read needs Accessibility. With
+the permission gone the server reports "another app has the audio session" and
+the panel holds its last image - which looks exactly like nothing is playing.
+
+After rebuilding: System Settings > Privacy & Security > Accessibility, remove
+the existing "Now Playing" entry with the minus button, add the app back, and
+switch it on. Removing first matters; the stale entry points at the old hash.
+
+`tests/healthcheck.sh` probes for this directly. Note that the probe has to ask
+for a process's WINDOWS - asking for its name succeeds without the permission
+and reports a false pass.
+
+A self-signed certificate in the login keychain would make the grant survive
+rebuilds, since TCC would key on a stable designated requirement instead of the
+hash. That is a change to the machine's security configuration, so it is left
+as a decision rather than done here.
