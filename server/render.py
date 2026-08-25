@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engines
 import panel
 import server as np_server
 
@@ -150,7 +151,8 @@ def cover_art(track, size=ART):
 
 def render(track, method="floyd", saturate=1.0, contrast=1.0,
            chroma=None, gamut=0.0, palette="ideal", pal_rgb=None,
-           art_only=False, neutral=0.0, black_point=0.0, brightness=1.0):
+           art_only=False, neutral=0.0, black_point=0.0, brightness=1.0,
+           blend=0.0):
     """Return (index array, complete).
 
     complete is False when the track HAD a cover URL but fetching it failed, so
@@ -183,9 +185,13 @@ def render(track, method="floyd", saturate=1.0, contrast=1.0,
         # A hand-tuned palette wins over the named presets.
         pal = (np.asarray(pal_rgb, np.float32) if pal_rgb is not None
                else panel.PALETTES.get(palette, panel.PAL_IDEAL))
+        # The tone stages above run whichever method is selected, so moving a
+        # slider means the same thing across all of them and the comparison
+        # stays a comparison of dithering rather than of whole pipelines.
         idx[0:ART, 0:W] = panel.dither(arr, method, pal,
                                        gamut=gamut > 0, gamut_strength=gamut,
-                                       weight=chroma, neutral=neutral)
+                                       weight=chroma, neutral=neutral,
+                                       blend=blend)
         complete = True
         if art_only:
             return idx[0:ART, 0:W], True

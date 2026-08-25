@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import mediaremote
 import numpy as np
+import engines
 import panel
 from PIL import Image
 
@@ -40,6 +41,7 @@ _cfg = {"follow_any": False, "serve_lan": False, "method": "jarvis",
         # worst-case hue error, and blend 0.2-0.3 minimises it. Everything else
         # off - brightness, contrast and saturation all degrade the worst cover.
         "neutral": 0.0, "black_point": 0.0, "brightness": 1.0,
+        "blend": 0.0, "saved": {}, "bindings": {},
         "palette": "ideal"}
 # Deezer keeps playing while minimised, so a momentary "no window"
 # must not blank the display - hold what we last resolved.
@@ -157,6 +159,53 @@ def _lan_ip():
         s.close()
 
 
+# Every setting a preset captures. Kept in one place so saving, applying and
+# validating cannot drift apart - the old "presets" only carried the six
+# pigment values, which is why a good look could not actually be saved.
+PRESET_KEYS = ("method", "saturate", "contrast", "chroma", "gamut", "neutral",
+               "black_point", "brightness", "blend", "palette", "pal")
+
+
+def _album_key(track):
+    """Identity a preset can be bound to.
+
+    The album rather than the track: covers belong to records, and a setting
+    chosen for one song is nearly always right for its neighbours.
+    """
+    if not track:
+        return None
+    a = (track.get("artist") or "").strip().lower()
+    b = (track.get("album") or track.get("title") or "").strip().lower()
+    return ("%s|%s" % (a, b)) if (a or b) else None
+
+
+def _album_label(track):
+    """Human-readable name for whatever a preset would bind to."""
+    if not track:
+        return None
+    a = (track.get("artist") or "").strip()
+    b = (track.get("album") or track.get("title") or "").strip()
+    return (" - ".join(x for x in (a, b) if x)) or None
+
+
+def settings_for(track):
+    """The settings to render this track with.
+
+    A preset bound to the album wins over the global settings, which is what
+    makes per-cover tuning stick: one record can want a different treatment
+    from the next, and the last thing tuned should not become the default for
+    everything.
+    """
+    key = _album_key(track)
+    name = (_cfg.get("bindings") or {}).get(key) if key else None
+    preset = (_cfg.get("saved") or {}).get(name) if name else None
+    out = {k: _cfg.get(k) for k in PRESET_KEYS}
+    if preset:
+        out.update({k: v for k, v in preset.items() if k in PRESET_KEYS})
+        out["_preset"] = name
+    return out
+
+
 # Whether a rendered frame actually had its cover, keyed by ETag. Bounded:
 # only the last few matter, and an unknown key is treated as complete.
 _frame_complete = {}
@@ -164,28 +213,31 @@ _frame_complete = {}
 
 def render_frame(track, want_png=False):
     """Packed frame plus its ETag, re-rendering only when the track changes."""
-    key = (track.get("id"), want_png,
-           _cfg.get("method"), _cfg.get("saturate"), _cfg.get("contrast"),
-           _cfg.get("chroma"), _cfg.get("gamut"), _cfg.get("palette"),
-           _cfg.get("pal"), _cfg.get("neutral"), _cfg.get("black_point"),
-           _cfg.get("brightness"))
+    st = settings_for(track)
+    key = (track.get("id"), want_png) + tuple(st.get(k) for k in PRESET_KEYS)
     with _frame_lock:
         if _frame_cache.get("key") == key and _frame_cache.get("body"):
             return _frame_cache["body"], _frame_cache["etag"]
     import render as epd
     t0 = time.time()
+    def _f(k, d):
+        try:
+            return float(st.get(k, d))
+        except (TypeError, ValueError):
+            return d
     idx, complete = epd.render(
         track,
-        _cfg.get("method", "atkinson"),
-        saturate=float(_cfg.get("saturate", 1.0)),
-        contrast=float(_cfg.get("contrast", 1.0)),
-        chroma=float(_cfg.get("chroma", panel.CHROMA_WEIGHT)),
-        gamut=float(_cfg.get("gamut", 0.0)),
-        palette=_cfg.get("palette", "ideal"),
-        pal_rgb=_parse_pal(_cfg.get("pal")),
-        neutral=float(_cfg.get("neutral", 0.0)),
-        black_point=float(_cfg.get("black_point", 0.0)),
-        brightness=float(_cfg.get("brightness", 1.0)))
+        st.get("method") or "atkinson",
+        saturate=_f("saturate", 1.0),
+        contrast=_f("contrast", 1.0),
+        chroma=_f("chroma", panel.CHROMA_WEIGHT),
+        gamut=_f("gamut", 0.0),
+        palette=st.get("palette") or "ideal",
+        pal_rgb=_parse_pal(st.get("pal")),
+        neutral=_f("neutral", 0.0),
+        black_point=_f("black_point", 0.0),
+        brightness=_f("brightness", 1.0),
+        blend=_f("blend", 0.0))
     if want_png:
         buf = io.BytesIO()
         panel.simulate(idx).save(buf, "PNG")
@@ -615,6 +667,14 @@ class Handler(BaseHTTPRequestHandler):
                                     for k, v in panel.PALETTES.items()},
                         "names": panel.NAMES,
                         "methods": panel.METHODS,
+                        "engines": sorted(engines.ENGINES),
+                        "blend": float(_cfg.get("blend", 0.0)),
+                        "saved": {k: v for k, v in
+                                  (_cfg.get("saved") or {}).items()},
+                        "album": _album_key((current() or {}).get("track")),
+                        "album_label": _album_label((current() or {}).get("track")),
+                        "bound": (_cfg.get("bindings") or {}).get(
+                            _album_key((current() or {}).get("track"))),
                         "palettes": list(panel.PALETTES)})
         elif u.path == "/players":
             # Diagnostics: who is registered with macOS as a now-playing app.
@@ -680,7 +740,8 @@ class Handler(BaseHTTPRequestHandler):
                             art_only=q.get("art", ["0"])[0] == "1",
                             neutral=num("neutral", 0.0),
                             black_point=num("black_point", 0.0),
-                            brightness=num("brightness", 1.0))
+                            brightness=num("brightness", 1.0),
+                            blend=num("blend", 0.0))
         pal_rgb = _parse_pal(q.get("pal", [None])[0])
         shown = (np.asarray(pal_rgb, np.uint8) if pal_rgb is not None
                  else panel.PALETTES.get(q.get("palette", ["ideal"])[0],
@@ -792,13 +853,56 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n))
         except Exception as e:
             return self._json({"error": "bad json: %s" % e}, 400)
-        if urllib.parse.urlparse(self.path).path != "/config":
+        path = urllib.parse.urlparse(self.path).path
+
+        if path == "/presets":
+            # Save the current look under a name, or bind a saved one to the
+            # album now playing, or delete one. Everything a preset captures
+            # is listed in PRESET_KEYS.
+            saved = _cfg.setdefault("saved", {})
+            binds = _cfg.setdefault("bindings", {})
+            act = req.get("action")
+            name = (req.get("name") or "").strip()[:60]
+
+            if act == "save":
+                if not name:
+                    return self._json({"error": "name required"}, 400)
+                src = req.get("settings") or {k: _cfg.get(k) for k in PRESET_KEYS}
+                saved[name] = {k: src[k] for k in PRESET_KEYS if k in src}
+            elif act == "delete":
+                saved.pop(name, None)
+                for k in [k for k, v in binds.items() if v == name]:
+                    binds.pop(k)          # a binding to nothing is worse than none
+            elif act == "bind":
+                key = _album_key((current() or {}).get("track"))
+                if not key:
+                    return self._json({"error": "nothing playing to bind to"}, 400)
+                if name:
+                    if name not in saved:
+                        return self._json({"error": "no such preset"}, 404)
+                    binds[key] = name
+                else:
+                    binds.pop(key, None)  # empty name clears the binding
+            else:
+                return self._json({"error": "unknown action"}, 400)
+
+            save_cfg()
+            with _frame_lock:
+                _frame_cache.clear()
+            tr = (current() or {}).get("track")
+            k = _album_key(tr)
+            return self._json({"saved": sorted(saved),
+                               "album": k,
+                               "bound": binds.get(k) if k else None})
+
+        if path != "/config":
             return self._json({"error": "not found"}, 404)
         changed = {}
         for k, lo, hi in (("saturate", 0.0, 4.0), ("contrast", 0.2, 3.0),
                           ("chroma", 0.0, 12.0), ("gamut", 0.0, 1.0),
                           ("neutral", 0.0, 20.0), ("black_point", 0.0, 0.5),
-                          ("brightness", 0.3, 2.5)):
+                          ("brightness", 0.3, 2.5),
+                          ("blend", 0.0, 1.0)):
             if k in req:
                 try:
                     _cfg[k] = max(lo, min(hi, float(req[k])))
@@ -1027,8 +1131,8 @@ TUNE_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 body{background:#0c0c0f;color:#eaeaea;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:22px}
 .wrap{max-width:1180px;margin:0 auto}
 h1{font-size:18px;font-weight:600;margin-bottom:2px}
-.sub{color:#83838d;font-size:13px;margin-bottom:18px}
-.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
+.sub{color:#83838d;font-size:13px;margin-bottom:16px}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
 .cell{background:#151519;border:1px solid #25252d;border-radius:8px;padding:10px}
 .cell h2{font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;
          color:#83838d;margin-bottom:8px}
@@ -1045,7 +1149,7 @@ h1{font-size:18px;font-weight:600;margin-bottom:2px}
 input[type=range]{width:100%;accent-color:#e0714c}
 input[type=range]:disabled{opacity:.3}
 input[type=checkbox]{accent-color:#e0714c;width:15px;height:15px;cursor:pointer}
-select{width:100%;background:#0f0f13;color:#eaeaea;border:1px solid #32323c;
+select,input[type=text]{width:100%;background:#0f0f13;color:#eaeaea;border:1px solid #32323c;
        border-radius:6px;padding:7px 9px;font-size:13px}
 .hint{font-size:11.5px;color:#6f6f78;margin-top:5px;line-height:1.45}
 .pig{display:flex;align-items:center;gap:10px;margin-bottom:8px}
@@ -1058,40 +1162,66 @@ select{width:100%;background:#0f0f13;color:#eaeaea;border:1px solid #32323c;
 button{border:1px solid #32323c;background:#1b1b21;color:#eaeaea;border-radius:6px;
        padding:8px 12px;font-size:13px;cursor:pointer}
 button.go{background:#e0714c;border-color:#e0714c;color:#1a0d08;font-weight:600;flex:1}
+button.warn{border-color:#5a2a2a;color:#d98a8a}
 button:disabled{opacity:.45;cursor:default}
 .state{font-size:12px;color:#83838d;min-height:17px;margin-top:9px}
 .busy{opacity:.5}
+
+/* preset bar */
+.presets{background:#151519;border:1px solid #25252d;border-radius:8px;
+         padding:14px 16px;margin-bottom:16px}
+.prow{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.prow select{flex:1;min-width:180px;width:auto}
+.prow input[type=text]{flex:1;min-width:150px;width:auto}
+.bound{font-size:12px;color:#83838d;margin-top:10px;line-height:1.5}
+.bound b{color:#c9c9d2;font-weight:600}
+.tag{display:inline-block;background:#241a14;border:1px solid #4a3225;color:#e0a07c;
+     border-radius:4px;padding:1px 7px;font-size:11px;margin-left:6px}
+.dirty{color:#e0a07c}
 @media(max-width:900px){.grid,.pair{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 <h1>Panel tuning</h1>
 <p class="sub">Left is the source. Right is what the panel will print, simulated
 with whatever pigment values are set below. Same code path as the real frame.</p>
 
+<div class="presets">
+  <div class="prow">
+    <select id="preset"><option value="">- saved looks -</option></select>
+    <button id="p_apply">Load</button>
+    <input type="text" id="p_name" placeholder="name this look" maxlength="60">
+    <button id="p_save">Save</button>
+    <button id="p_del" class="warn">Delete</button>
+  </div>
+  <div class="bound" id="bound"></div>
+  <div class="prow" style="margin-top:10px">
+    <button id="p_bind">Always use this look for this album</button>
+    <button id="p_unbind" class="warn">Stop using it here</button>
+  </div>
+</div>
+
 <div class="pair">
   <div class="cell"><h2>Source</h2><img id="src" alt="Original cover"></div>
   <div class="cell"><h2>On the panel</h2><img id="out" alt="Dithered result"></div>
 </div>
-
 <div class="grid">
   <div class="box"><h3>Pigments</h3>
     <div id="pigs"></div>
     <p class="hint">What each of the six inks actually looks like on the glass.
-    These drive both the matching and the preview, so getting them close to the
-    real thing is what makes the preview trustworthy. The built-in values were
+    These drive the matching and the preview, so getting them close to the real
+    thing is what makes the preview trustworthy. The built-in values were
     estimated by eye, not instrumented.</p>
     <div class="head" style="margin-top:14px"><label for="blend">Blend</label>
       <span class="v" id="v_blend"></span></div>
     <input type="range" id="blend" min="0" max="1" step="0.05">
-    <p class="hint">0 is pure primaries the panel cannot actually make; 1 is a
-    muted real-ink measurement. Pure leaves a large residual everywhere so the
-    diffusion keeps mixing and detail survives; muted puts colours where they
-    truly land but collapses areas into flat patches.
-    <b>0.2 to 0.3.</b> Measured over 11 covers, hue error is worse in both
-    directions: pure primaries are the worst setting on the hardest cover, and
-    past 0.4 the inks sit close enough together that hue discrimination
-    collapses &mdash; a cyan subject resolves to green at 0.6. Flat patches climb
-    steadily, so 0.2 is the safer end. Moving this rewrites the six values
-    above, still hand-editable.</p>
+    <p class="hint"><b>Keep this at 0.</b> 0 is the pure primaries; 1 is a muted
+    real-ink measurement. Muted values sit close to the colours already in a
+    photograph, which leaves almost no error for the diffusion to move around,
+    so smooth regions collapse into solid blocks of one ink. Measured over six
+    covers: at 0 about 0.2% of the picture is flat, at 1.0 it is 12.5% - the
+    same sixty-fold rise the eye reads as posterisation. Pure primaries sit far
+    from every real colour, so there is always a residual to keep the inks
+    mixing. Moving this rewrites the six values above and also feeds the
+    reframe engines, which take it directly.</p>
     <div class="btns">
       <button data-preset="ideal">pure</button>
       <button data-preset="reframe">reframe 0.6</button>
@@ -1102,11 +1232,9 @@ with whatever pigment values are set below. Same code path as the real frame.</p
 
   <div class="box"><h3>Processing</h3>
     <div class="stage">
-      <div class="head"><label for="method">Algorithm</label></div>
+      <div class="head"><label for="method">Engine</label></div>
       <select id="method"></select>
-      <p class="hint">Error diffusion pushes each pixel's error into its
-      neighbours. Bayer uses a fixed threshold grid. "nearest" does no
-      dithering at all - useful as a baseline.</p>
+      <p class="hint" id="m_hint"></p>
     </div>
     <div class="stage" data-k="brightness">
       <div class="head"><input type="checkbox" id="on_brightness">
@@ -1126,12 +1254,15 @@ with whatever pigment values are set below. Same code path as the real frame.</p
       <div class="head"><input type="checkbox" id="on_saturate">
         <label for="on_saturate">Saturation</label><span class="v" id="v_saturate"></span></div>
       <input type="range" id="saturate" min="0.4" max="4" step="0.05">
-      <p class="hint">Pushes colour towards the inks. Helps most covers a
-      little and hurts a few badly: it drives specific hues outside the
-      reachable gamut, where the residual cannot resolve. Magenta and cyan are
-      the vulnerable ones &mdash; cyan needs high green and high blue at once, and
-      past about 1.8 it collapses to green. Worth raising on a dark, low-chroma
-      cover; check saturated ones before committing.</p>
+      <p class="hint">Pushes colour towards the inks, and the single most
+      dangerous control here. The six inks cannot reach magenta or cyan at all,
+      and raising this drives those hues further outside what the panel can
+      make: on a bright pink cover 77% of the picture is already unreachable,
+      and at 2.2 the red channel clips on 97% of it while blue keeps climbing,
+      rotating the hue. Measured, that turns an unavoidable 15% blue ink into
+      23%, and the cover reads violet rather than pink. Blue-ink share is
+      lowest around 1.0 and rises in both directions. Worth raising on a dark,
+      low-chroma cover; check anything pink, purple or cyan before committing.</p>
     </div>
     <div class="stage" data-k="neutral">
       <div class="head"><input type="checkbox" id="on_neutral">
@@ -1139,9 +1270,7 @@ with whatever pigment values are set below. Same code path as the real frame.</p
       <input type="range" id="neutral" min="0.5" max="12" step="0.5">
       <p class="hint">Stops things that should be grey resolving to a colour -
       a silver helmet coming out blue, for instance. Only applies where the
-      SOURCE is near-neutral, so saturated colours keep mixing freely. This is
-      the control that used to be "hue priority", which applied everywhere and
-      so had to trade one against the other.</p>
+      SOURCE is near-neutral, so saturated colours keep mixing freely.</p>
     </div>
     <div class="stage" data-k="black_point">
       <div class="head"><input type="checkbox" id="on_black_point">
@@ -1149,40 +1278,59 @@ with whatever pigment values are set below. Same code path as the real frame.</p
       <input type="range" id="black_point" min="0.01" max="0.3" step="0.01">
       <p class="hint">Anything darker than this becomes solid black before
       dithering. A near-black background otherwise sits just above the darkest
-      ink and error diffusion scatters bright dots across it. Raise until the
-      blacks go clean; too high and shadow detail disappears with them.</p>
+      ink and error diffusion scatters bright dots across it.</p>
     </div>
     <div class="stage" data-k="chroma">
       <div class="head"><input type="checkbox" id="on_chroma">
-        <label for="on_chroma">Hue priority (legacy)</label><span class="v" id="v_chroma"></span></div>
-      <input type="range" id="chroma" min="1" max="10" step="0.5">
-      <p class="hint">The blunt version: penalises hue error everywhere, not
-      just in neutrals. Prefer "Keep greys neutral" above.</p>
+        <label for="on_chroma">Chroma weight</label><span class="v" id="v_chroma"></span></div>
+      <input type="range" id="chroma" min="0.1" max="8" step="0.1">
+      <p class="hint">How much a hue error costs against a brightness error -
+      on top of a bias the matcher already carries, so 1.0 is not neutral.
+      Lowering it below 1 pulls green ink into covers that should have none;
+      measured, one blue cover went from 0.1% green to 18%.</p>
     </div>
     <div class="stage" data-k="gamut">
       <div class="head"><input type="checkbox" id="on_gamut">
-        <label for="on_gamut">Gamut easing</label><span class="v" id="v_gamut"></span></div>
-      <input type="range" id="gamut" min="0.05" max="1" step="0.05">
-      <p class="hint">Off clips anything brighter than the panel's white to flat
-      white. On eases the extremes inward, costing a little overall contrast.</p>
-    </div>
-    <div class="stage">
-      <div class="head"><input type="checkbox" id="art"><label for="art">Cover only (hide the text panel)</label></div>
+        <label for="on_gamut">Gamut ease</label><span class="v" id="v_gamut"></span></div>
+      <input type="range" id="gamut" min="0.1" max="1" step="0.05">
+      <p class="hint">Eases colours the panel cannot reach towards ones it can.
+      Measured to do nothing across the mid-tones - it only ever acts on
+      near-black and near-white.</p>
     </div>
     <div class="btns">
-      <button id="reset">Reset all</button>
       <button id="apply" class="go">Apply to panel</button>
+      <button id="reset">Reset all</button>
     </div>
-    <p class="state" id="state"></p>
+    <div class="state" id="state"></div>
   </div>
-</div></div>
+</div>
+</div>
 <script>
 const SL=['brightness','contrast','saturate','neutral','black_point','chroma','gamut'];
-const OFF={brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,chroma:1,gamut:0};      // value that disables each stage
-const D={method:'jarvis',brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,chroma:1,gamut:1};
+const OFF={brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,chroma:1,gamut:0};
+const D={method:'floyd',brightness:1,contrast:1,saturate:1,neutral:0,black_point:0,
+         chroma:1,gamut:0,blend:0};
+// Everything a saved look carries. Must match PRESET_KEYS on the server, or a
+// look would come back missing whatever the two disagree about.
+const KEYS=['method','saturate','contrast','chroma','gamut','neutral',
+            'black_point','brightness','blend','palette','pal'];
+const ENGINE_HINT={
+  __native:'Error diffusion written here: serpentine scan, error carried in an '+
+    'extended range, and a 64-level table for matching. Bayer uses a fixed '+
+    'threshold grid; "nearest" does no dithering at all, as a baseline.',
+  reframe:'Upstream reframe, ported as it actually runs there: the whole job '+
+    'goes to PIL’s quantize(). Error is carried in 8-bit integers, the scan '+
+    'is strictly left to right, and matching happens in PIL’s own space. A '+
+    'genuinely separate implementation, not a variation — it shares no code '+
+    'with the native one, so the difference you see is the method.',
+  reframe_ordered:'Upstream’s other mode: a Bayer threshold grid sized from '+
+    'the spacing between inks. No feedback loop, so it cannot drift, and the '+
+    'texture is regular rather than scattered.'};
 const $=i=>document.getElementById(i);
-let cur={...D}, on={brightness:false,contrast:false,saturate:false,neutral:false,black_point:false,chroma:false,gamut:false};
-let pig=[], names=[], presets={}, timer=null;
+let cur={...D}, on={brightness:false,contrast:false,saturate:false,neutral:false,
+                    black_point:false,chroma:false,gamut:false};
+let pig=[], names=[], presets={}, saved={}, album=null, albumLabel=null,
+    bound=null, engines=[], timer=null;
 
 function hex(a){return '#'+a}
 function palParam(){return pig.join(',')}
@@ -1193,30 +1341,33 @@ function paint(){
                   $('on_'+k).checked=on[k];
                   $('v_'+k).textContent=on[k]?(+cur[k]).toFixed(2):'off'; });
   $('method').value=cur.method;
+  $('blend').value=cur.blend||0;
+  $('v_blend').textContent=(+(cur.blend||0)).toFixed(2);
+  $('m_hint').textContent=ENGINE_HINT[cur.method]||ENGINE_HINT.__native;
 }
 function drawPigs(){
   const box=$('pigs'); box.innerHTML='';
   pig.forEach((h,i)=>{
-    const row=document.createElement('div'); row.className='pig';
-    row.innerHTML='<input type="color" value="'+hex(h)+'">'
-      +'<span class="nm">'+(names[i]||('ink '+i))+'</span>'
-      +'<input class="hex" value="'+h+'" maxlength="6" spellcheck="false">';
-    const [c,,t]=row.children;
-    c.oninput=e=>{ pig[i]=e.target.value.slice(1); t.value=pig[i]; schedule(); };
-    t.oninput=e=>{ const v=e.target.value.replace(/[^0-9a-f]/gi,'').slice(0,6);
-                   e.target.value=v; if(v.length===6){pig[i]=v; c.value=hex(v); schedule();} };
-    box.appendChild(row);
+    const r=document.createElement('div'); r.className='pig';
+    r.innerHTML='<span class="nm">'+(names[i]||('ink '+i))+'</span>'+
+      '<input type="color" value="'+hex(h)+'">'+
+      '<input class="hex" value="'+h+'" spellcheck="false">';
+    const c=r.querySelector('input[type=color]'), t=r.querySelector('.hex');
+    c.oninput=()=>{ pig[i]=c.value.slice(1); t.value=pig[i]; schedule(); };
+    t.onchange=()=>{ const v=t.value.replace(/[^0-9a-f]/gi,'').slice(0,6);
+                     if(v.length===6){ pig[i]=v.toLowerCase(); c.value=hex(pig[i]); schedule(); }
+                     else t.value=pig[i]; };
+    box.appendChild(r);
   });
 }
 function preview(){
-  // Every stage the server reads has to be sent. brightness, neutral and
-  // black_point were missing here, so the server fell back to their defaults
-  // and those three sliders moved without changing the picture.
+  // Every stage the server reads has to be sent, or it silently uses its own
+  // default and the slider appears to do nothing.
   const q=new URLSearchParams({method:cur.method,contrast:eff('contrast'),
     saturate:eff('saturate'),chroma:eff('chroma'),gamut:eff('gamut'),
     brightness:eff('brightness'),neutral:eff('neutral'),
-    black_point:eff('black_point'),
-    pal:palParam(), art:$('art').checked?'1':'0', _:Date.now()});
+    black_point:eff('black_point'),blend:cur.blend||0,
+    pal:palParam(), art:'1', _:Date.now()});
   const out=$('out'); out.classList.add('busy');
   const n=new Image();
   n.onload=()=>{out.src=n.src; out.classList.remove('busy'); $('state').textContent='';};
@@ -1226,64 +1377,145 @@ function preview(){
 }
 function schedule(){ clearTimeout(timer); timer=setTimeout(preview,170); }
 
+function snapshot(){
+  const o={pal:palParam(), blend:cur.blend||0, method:cur.method, palette:cur.palette||'ideal'};
+  SL.forEach(k=>o[k]=eff(k));
+  return o;
+}
+function drawPresets(){
+  const s=$('preset'), keep=s.value;
+  s.innerHTML='<option value="">- saved looks -</option>';
+  Object.keys(saved).sort().forEach(n=>{
+    const o=document.createElement('option'); o.value=n; o.textContent=n;
+    if(n===bound) o.textContent=n+'  (used for this album)';
+    s.appendChild(o);
+  });
+  s.value=keep;
+  const b=$('bound');
+  if(!album){ b.innerHTML='Nothing is playing, so there is no album to bind a look to.'; }
+  else if(bound){ b.innerHTML='<b>'+albumLabel+'</b> uses <b>'+bound+'</b>'+
+      '<span class="tag">bound</span><br>Everything else uses whatever is set below.'; }
+  else { b.innerHTML='<b>'+albumLabel+'</b> uses the settings below, like everything else.'+
+      '<br>Bind a saved look to it if this record needs its own treatment.'; }
+  $('p_unbind').disabled=!bound;
+  $('p_bind').disabled=!album;
+}
+function post(body,then){
+  fetch('/presets',{method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if(d.error){ $('state').textContent=d.error; return; }
+      bound=d.bound; album=d.album!==undefined?d.album:album;
+      load(then);
+    }).catch(e=>{ $('state').textContent=String(e); });
+}
+function applyPreset(n){
+  const p=saved[n]; if(!p) return;
+  cur.method=p.method||cur.method;
+  cur.blend=p.blend||0; cur.palette=p.palette||cur.palette;
+  if(p.pal) pig=p.pal.split(',');
+  SL.forEach(k=>{ if(p[k]===undefined) return;
+                  const isOff=Math.abs(p[k]-OFF[k])<1e-9;
+                  on[k]=!isOff; cur[k]=p[k]; });
+  paint(); drawPigs(); preview();
+  $('state').textContent='loaded "'+n+'"';
+}
 SL.forEach(k=>{
-  $(k).addEventListener('input',e=>{cur[k]=parseFloat(e.target.value);
-    $('v_'+k).textContent=cur[k].toFixed(2); schedule();});
-  $('on_'+k).addEventListener('change',e=>{on[k]=e.target.checked; paint(); schedule();});
+  $(k).oninput=()=>{ cur[k]=+$(k).value; $('v_'+k).textContent=(+cur[k]).toFixed(2); schedule(); };
+  $('on_'+k).onchange=()=>{ on[k]=$('on_'+k).checked; paint(); schedule(); };
 });
-$('method').addEventListener('change',e=>{cur.method=e.target.value; schedule();});
-$('art').addEventListener('change',schedule);
+$('method').onchange=()=>{ cur.method=$('method').value; paint(); schedule(); };
+$('blend').oninput=()=>{
+  cur.blend=+$('blend').value;
+  $('v_blend').textContent=cur.blend.toFixed(2);
+  // The blend means the same thing to both kinds of engine, but reaches them
+  // by different routes: it rewrites the six pigments the native matcher uses,
+  // and is passed straight through to the reframe engines.
+  const pure=presets.ideal, muted=presets.muted;
+  if(pure&&muted){
+    pig=pure.map((h,i)=>{
+      const a=parseInt(h,16), b=parseInt(muted[i],16), t=cur.blend;
+      const mix=(sh)=>Math.round((((a>>sh)&255)*(1-t))+(((b>>sh)&255)*t));
+      return [mix(16),mix(8),mix(0)].map(v=>v.toString(16).padStart(2,'0')).join('');
+    });
+    drawPigs();
+  }
+  schedule();
+};
 document.querySelectorAll('[data-preset]').forEach(b=>b.onclick=()=>{
   if(presets[b.dataset.preset]){ pig=[...presets[b.dataset.preset]]; drawPigs(); schedule(); }
 });
-function lerpHex(a,b,t){
-  const p=h=>[0,2,4].map(i=>parseInt(h.slice(i,i+2),16));
-  const A=p(a), B=p(b);
-  return A.map((v,i)=>Math.round(v*(1-t)+B[i]*t))
-          .map(v=>Math.max(0,Math.min(255,v)).toString(16).padStart(2,'0')).join('');
-}
-function applyBlend(t){
-  const pure=presets.ideal, muted=presets.muted;
-  if(!pure||!muted) return;
-  pig = pure.map((h,i)=>lerpHex(h, muted[i], t));
-  $('v_blend').textContent=t.toFixed(2);
-  drawPigs(); schedule();
-}
-$('blend').addEventListener('input',e=>applyBlend(parseFloat(e.target.value)));
-
-$('reset').onclick=()=>{ cur={...D}; on={brightness:false,contrast:false,saturate:false,neutral:false,black_point:false,chroma:false,gamut:false};
-  $('blend').value=0.25; applyBlend(0.25); paint(); };
-$('apply').onclick=async()=>{
-  $('apply').disabled=true; $('state').textContent='saving…';
-  const body={method:cur.method,pal:palParam()};
-  SL.forEach(k=>body[k]=eff(k));
-  try{
-    await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-                           body:JSON.stringify(body)});
-    $('state').textContent='saved — the panel redraws on its next check.';
-  }catch(e){ $('state').textContent='could not save: '+e; }
-  $('apply').disabled=false;
+$('p_apply').onclick=()=>{ const n=$('preset').value; if(n) applyPreset(n); };
+$('preset').onchange=()=>{ const n=$('preset').value; if(n) $('p_name').value=n; };
+$('p_save').onclick=()=>{
+  const n=($('p_name').value||$('preset').value||'').trim();
+  if(!n){ $('state').textContent='give the look a name first'; return; }
+  post({action:'save',name:n,settings:snapshot()},()=>{
+    $('preset').value=n; $('state').textContent='saved "'+n+'"'; });
 };
-fetch('/config').then(r=>r.json()).then(d=>{
-  const sel=$('method');
-  (d.methods||['atkinson']).forEach(m=>{
-    const o=document.createElement('option'); o.value=m; o.textContent=m; sel.appendChild(o); });
-  presets=d.presets||{}; names=d.names||[];
-  pig = (d.pal && d.pal.split(',').length===6) ? d.pal.split(',')
-      : (presets[d.palette||'ideal'] || presets.ideal || []);
-  SL.forEach(k=>{ if(typeof d[k]==='number'){ cur[k]=d[k]; on[k]=(d[k]!==OFF[k]); } });
-  if(d.method) cur.method=d.method;
-  // Show where the current pigments sit on the blend, if they are on it.
-  let t=0.6;
-  if(presets.ideal&&presets.muted){
-    const a=parseInt(presets.ideal[4].slice(2,4),16), b=parseInt(presets.muted[4].slice(2,4),16);
-    const c=parseInt((pig[4]||presets.ideal[4]).slice(2,4),16);
-    if(b!==a) t=Math.max(0,Math.min(1,(c-a)/(b-a)));
+$('p_del').onclick=()=>{
+  const n=$('preset').value;
+  if(!n){ $('state').textContent='pick a saved look to delete'; return; }
+  post({action:'delete',name:n},()=>{ $('state').textContent='deleted "'+n+'"'; });
+};
+$('p_bind').onclick=()=>{
+  const n=$('preset').value;
+  if(!n){ $('state').textContent='pick a saved look to use for this album'; return; }
+  post({action:'bind',name:n},()=>{ $('state').textContent='"'+n+'" will be used here'; });
+};
+$('p_unbind').onclick=()=>post({action:'bind',name:''},
+  ()=>{ $('state').textContent='this album is back to the shared settings'; });
+
+$('apply').onclick=()=>{
+  const body=snapshot();
+  $('apply').disabled=true; $('state').textContent='applying...';
+  fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+                   body:JSON.stringify(body)})
+    .then(r=>r.json()).then(()=>{ $('state').textContent='applied - the panel picks '+
+      'it up on its next poll'; $('apply').disabled=false; })
+    .catch(e=>{ $('state').textContent=String(e); $('apply').disabled=false; });
+};
+$('reset').onclick=()=>{ cur={...D}; on={brightness:false,contrast:false,saturate:false,
+  neutral:false,black_point:false,chroma:false,gamut:false};
+  if(presets.ideal) pig=[...presets.ideal];
+  paint(); drawPigs(); preview(); $('state').textContent='back to defaults (not applied)'; };
+
+function load(then){
+  fetch('/config').then(r=>r.json()).then(d=>{
+    presets=d.presets||{}; names=d.names||[]; engines=d.engines||[];
+    saved=d.saved||{}; album=d.album; albumLabel=d.album_label; bound=d.bound;
+    const sel=$('method');
+    if(!sel.options.length){
+      (d.methods||['floyd']).forEach(m=>{
+        const o=document.createElement('option'); o.value=m;
+        o.textContent=engines.indexOf(m)>=0 ? m.replace(/_/g,' ')+'  (separate engine)' : m;
+        sel.appendChild(o);
+      });
+    }
+    if(!pig.length){
+      pig=d.pal ? d.pal.split(',')
+                : (presets[d.palette||'ideal'] || presets.ideal || []);
+    }
+    cur.method=d.method||cur.method; cur.palette=d.palette||'ideal';
+    cur.blend=d.blend||0;
+    SL.forEach(k=>{ if(d[k]===undefined) return;
+      const isOff=Math.abs(d[k]-OFF[k])<1e-9;
+      on[k]=!isOff; cur[k]=d[k]; });
+    paint(); drawPigs(); drawPresets();
+    if(then) then(); else preview();
+  }).catch(e=>{ $('state').textContent='cannot reach the server: '+e; });
+}
+load();
+// The bound album changes when the track does, so keep the header honest.
+setInterval(()=>fetch('/config').then(r=>r.json()).then(d=>{
+  if(d.album!==album||d.bound!==bound||
+     Object.keys(d.saved||{}).length!==Object.keys(saved).length){
+    saved=d.saved||{}; album=d.album; albumLabel=d.album_label; bound=d.bound;
+    drawPresets();
   }
-  $('blend').value=t; $('v_blend').textContent=t.toFixed(2);
-  drawPigs(); paint(); preview();
-}).catch(()=>{ drawPigs(); paint(); preview(); });
-</script></body></html>"""
+}).catch(()=>{}), 4000);
+</script></body></html>
+"""
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])

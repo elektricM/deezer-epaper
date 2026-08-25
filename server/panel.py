@@ -7,6 +7,7 @@ for it lives here so the web preview and the panel frame cannot drift apart.
 """
 import os
 import sys
+import engines
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -87,7 +88,11 @@ BAYER8 = np.array([
     [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21],
 ], dtype=np.float32) / 64.0 - 0.5
 
-METHODS = ["nearest", "floyd", "atkinson", "jarvis", "sierra", "bayer"]
+# The native engine's own kernels, plus the independent engines from
+# engines.py. They are listed together because the tuner picks one of them,
+# but they are not variations of a single implementation - see engines.py.
+METHODS = ["nearest", "floyd", "atkinson", "jarvis", "sierra", "bayer",
+           "reframe", "reframe_ordered"]
 
 CLAMP_LO, CLAMP_HI = -64.0, 320.0
 LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
@@ -259,8 +264,19 @@ def gamut_map(arr, pal, strength=1.0):
 
 
 def dither(arr, method="floyd", pal=None, gamut=True, gamut_strength=1.0,
-           weight=None, neutral=0.0):
-    """arr: HxWx3 float RGB. Returns HxW uint8 palette indices."""
+           weight=None, neutral=0.0, blend=0.0):
+    """arr: HxWx3 float RGB. Returns HxW uint8 palette indices.
+
+    Anything named in METHODS works here, including the separate engines in
+    engines.py. Those bring their own matching and their own palette, so the
+    palette and matching arguments do not reach them - only `blend`, which
+    chooses between pure primaries and measured ink. Dispatching in one place
+    keeps METHODS honest: a method that is listed can always be called.
+    """
+    if method in engines.ENGINES:
+        img = Image.fromarray(np.clip(np.asarray(arr, np.float32), 0, 255)
+                              .astype(np.uint8))
+        return engines.ENGINES[method](img, muted=blend)
     pal = PAL_MEASURED if pal is None else pal
     buf = np.asarray(arr, dtype=np.float32).copy()
     if gamut:
