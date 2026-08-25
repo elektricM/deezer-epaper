@@ -600,12 +600,24 @@ def enrich(st):
     artist, title = st.get("artist"), st.get("title")
     album = st.get("album") or None
     dz = deezer_enrich(artist, title, album)
+    # Where the catalogue corroborated the track, its album and duration are
+    # preferred over the player's. Not because it knows better - the player is
+    # the thing actually playing - but because the SAME song has to produce the
+    # SAME frame whichever way it was seen. macOS exposes one now-playing
+    # client at a time, so a browser video starting or ending flips this track
+    # between here and the Deezer-window fallback, which reads its metadata
+    # straight from the catalogue. The player's duration is a float truncated
+    # to a second and the catalogue's is already an integer, so the two
+    # regularly disagree by one - and one second is enough to redraw the
+    # duration in the info band, change the frame bytes, and cost the panel a
+    # full twenty-second refresh for a picture that looks identical.
     track = {
         "title": title or dz.get("title"),
         "artist": artist or dz.get("artist"),
-        "album": album or dz.get("album"),
+        "album": dz.get("album") or album,
         "cover": dz.get("cover"),
-        "duration": int(st["duration"]) if st.get("duration") else dz.get("duration"),
+        "duration": dz.get("duration") or (
+            int(st["duration"]) if st.get("duration") else None),
         "explicit": dz.get("explicit", False),
         "link": dz.get("link"),
         # Identity for "is this already on the glass". Must include the title:
