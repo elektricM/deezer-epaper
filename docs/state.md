@@ -82,3 +82,37 @@ the wrong thing:
 - The ink values are still estimates by eye. A colorimeter would put the whole
   palette question on a real footing and is the single highest-value measurement
   left.
+
+## Open questions the numbers cannot settle
+
+Three findings from the rendering audit change what appears on the glass.
+None are applied; each needs a look at the panel, not a metric.
+
+**The matcher is not Euclidean sRGB, despite the comments.** `_lut` splits each
+colour into a scalar luma and a chroma remainder, and the resulting distance
+works out to `|u|^2 + 4(LUMA.u)^2 - 2(LUMA.u)(1.u)`. The cross term of a true
+Euclidean distance is missing, so a grey-axis error is charged about a third of
+what Euclidean would charge, and no value of `chroma` recovers it. Over the
+lookup grid, 29% of cells on the ideal palette would pick a different ink under
+plain Euclidean distance. The current settings were tuned against this metric,
+so "fixing" it is not obviously an improvement - it is a different picture that
+would need retuning from scratch.
+
+**The quantiser floors.** `_QUANT` truncates, so every lookup asks about a
+colour roughly 2.5 levels darker than the pixel really is, in all three
+channels. Rounding to nearest removes the bias and cuts lookup error from 1.6%
+to 1.0%. It also shifts ink share away from the dark inks, and some of the
+speckle in shadows comes from exactly this bias - which is a wanted part of the
+look, so this may be load-bearing.
+
+**The tone chain clips between stages.** `brightness` and `contrast` each clamp
+to 0-255 before the next stage runs, per channel, so a clipped channel shifts
+hue and the following stage amplifies the result. At the live settings
+(brightness 1.05, saturate 2.2) 53% of pixels on one cover hit the first clip
+before saturation runs, and the final value differs by up to 13.6 levels from
+the same chain clipped only once at the end. Removing the two intermediate
+clips is a one-line change and does nothing at brightness = contrast = 1.0.
+
+Related: at saturate 2.2 the per-channel clip means the control has stopped
+behaving like saturation and is closer to a posterise onto the RGB cube's
+surface. That may be *why* it works with a near-primary palette.
