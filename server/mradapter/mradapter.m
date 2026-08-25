@@ -60,7 +60,16 @@ static NSNumber *finite(id v) {
 
 static void emit(NSDictionary *d) {
     NSString *id_ = identity(d);
-    if (gStream && gLastIdentity && [gLastIdentity isEqualToString:id_]) return;
+    if (gStream && gLastIdentity && [gLastIdentity isEqualToString:id_]) {
+        // Nothing new to say, but still touch the pipe. Staying silent is what
+        // let an orphaned adapter hold a MediaRemote client for hours after
+        // its reader died - with no write, there is no SIGPIPE to end it. A
+        // bare newline is ignored by the parser, which reads only lines that
+        // begin with '{', and costs one byte per tick.
+        fputc('\n', stdout);
+        fflush(stdout);
+        return;
+    }
     gLastIdentity = id_;
     NSData *j = nil;
     @try {

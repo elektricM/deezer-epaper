@@ -18,3 +18,6 @@ __pycache__/
 
 # Generated contact sheets (regenerable)
 sheets/
+
+# Local tests, not shipped
+tests/

@@ -6,6 +6,7 @@ from spatial dithering. Anything that describes the panel or converts an image
 for it lives here so the web preview and the panel frame cannot drift apart.
 """
 import os
+import sys
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -132,7 +133,10 @@ def load(path):
 def fit(img, w=WIDTH, h=HEIGHT, mode="crop"):
     """Bring an image to w x h without distorting it, rotating when the source
     orientation does not match the target's."""
-    if (img.width > img.height) != (w > h):
+    # Only when the target itself has an orientation. The art slot is square,
+    # and (w > h) is False for a square, so without this guard every landscape
+    # source was turned on its side.
+    if w != h and (img.width > img.height) != (w > h):
         img = img.rotate(90, expand=True)
     sr, dr = img.width / img.height, w / h
     if mode == "pad":
@@ -158,12 +162,17 @@ _LUT_BITS = 6                     # 64 levels per axis, 262 144 cells
 _LUT_MAX = (1 << _LUT_BITS) - 1
 _QUANT = (np.arange(256) * _LUT_MAX // 255).astype(np.int32).tolist()
 _lut_cache = {}
+_LUT_CACHE_MAX = 4                # entries; each is 256 KB
+_LUT_CHUNK = 16384                # grid rows per pass when building one
 
 
-# How much more a hue error costs than a brightness error. 1.0 is plain
-# distance; weighting it globally suppresses the mixing that produces
-# intermediate colours. Use the `neutral` argument instead, which only acts
-# where the source is near-neutral.
+# How much more a hue error costs than a brightness error, ON TOP of the bias
+# the metric already carries. Note that 1.0 is NOT plain Euclidean distance:
+# the luma/chroma split below charges a grey-axis error about a third of what
+# Euclidean would, so the matcher is chroma-biased by construction. This knob
+# scales the chroma term further. Raising it globally suppresses the mixing
+# that produces intermediate colours - prefer the `neutral` argument, which
+# acts only where the source is already near-neutral.
 CHROMA_WEIGHT = 1.0
 
 # Source colours below this chroma get the full neutral penalty; tapers above.
@@ -183,8 +192,11 @@ def _lut(pal, weight=None, neutral=0.0):
     term discounts chroma error as chroma rises, so across the distances a
     six-ink palette spans it rates pure magenta nearer blue than red.
 
-    The table is purely a speed device - identical results to a per-pixel
-    search, about 8x faster. tools/check_preview.py asserts the equivalence.
+    The table is a speed device, about 8x faster than searching per pixel. It
+    is an approximation, not an equivalence: colours are quantised to 64 levels
+    per axis first, so around 1.6% of 8-bit colours land on a different ink
+    than an exact search would pick - always an immediate neighbour. Error
+    diffusion absorbs that, since the residual is fed back either way.
     """
     weight = CHROMA_WEIGHT if weight is None else weight
     key = (np.asarray(pal, np.float32).tobytes(), float(weight), float(neutral))
@@ -208,8 +220,22 @@ def _lut(pal, weight=None, neutral=0.0):
     if neutral > 0:
         src_chroma = np.linalg.norm(gc, axis=-1, keepdims=True)
         w = weight + neutral * np.clip(1.0 - src_chroma / NEUTRAL_RANGE, 0.0, 1.0)
-    d = (gl - pl.T) ** 2 + w * ((gc[:, None, :] - pc[None, :, :]) ** 2).sum(-1)
-    idx = d.argmin(1).astype(np.uint8)
+    # In one shot the (cells, inks, 3) difference alone is 37 MB of float64 and
+    # the whole build peaks near 112 MB - for a 256 KB answer. Chunking the
+    # rows holds the peak flat with no change to the result.
+    idx = np.empty(grid.shape[0], np.uint8)
+    for s in range(0, grid.shape[0], _LUT_CHUNK):
+        e = s + _LUT_CHUNK
+        wc = w[s:e] if np.ndim(w) else w
+        d = ((gl[s:e] - pl.T) ** 2
+             + wc * ((gc[s:e, None, :] - pc[None, :, :]) ** 2).sum(-1))
+        idx[s:e] = d.argmin(1).astype(np.uint8)
+
+    # Bounded: the tuning page makes a fresh key on every slider step and every
+    # colour-picker keystroke, and each entry is 256 KB kept forever. A miss
+    # costs about 30 ms, so a small cache loses nothing.
+    if len(_lut_cache) >= _LUT_CACHE_MAX:
+        _lut_cache.pop(next(iter(_lut_cache)))
     _lut_cache[key] = idx
     return idx
 
@@ -254,55 +280,111 @@ def dither(arr, method="floyd", pal=None, gamut=True, gamut_strength=1.0,
         return lut[flat].reshape(h, w)
 
     ker, divisor = KERNELS[method]
-    # Flat Python lists: several times faster than per-element numpy indexing
-    # for a strictly sequential loop.
-    px = buf.reshape(-1).tolist()
-    lutl = lut.tolist()
-    palr = [tuple(float(c) for c in row) for row in np.asarray(pal, np.float32)]
-    Q, LB, LO, HI = _QUANT, _LUT_BITS, CLAMP_LO, CLAMP_HI
-    stride = w * 3
-    out = np.zeros(h * w, np.uint8)
-    outl = out.tolist()
+    # Every shipped kernel's taps sum to at most its divisor, so the in-bounds
+    # sum can never exceed it and the normalising denominator is just the
+    # divisor. The loop used to rediscover that per pixel with a whole extra
+    # pass over the kernel. If a future kernel breaks the assumption this
+    # catches it at import rather than silently over-diffusing at the edges.
+    assert sum(t[2] for t in ker) <= divisor, \
+        "%s taps exceed its divisor; edge normalisation would need rethinking" % method
 
+    kdx = np.array([t[0] for t in ker], np.int64)
+    kdy = np.array([t[1] for t in ker], np.int64)
+    kwt = np.array([t[2] for t in ker], np.float64)
+
+    # float64 throughout, matching what .tolist() used to widen the float32
+    # buffer to. The arithmetic below is bit-for-bit the same either way, which
+    # is what lets the fast path and the fallback agree.
+    px = buf.reshape(-1).astype(np.float64)
+    palf = np.asarray(pal, np.float32).astype(np.float64)
+    quant = np.asarray(_QUANT, np.int64)
+
+    out = _run_diffuse(px, lut.astype(np.int64), palf, quant, _LUT_BITS,
+                       float(CLAMP_LO), float(CLAMP_HI), h, w,
+                       kdx, kdy, kwt, float(divisor))
+    return out.astype(np.uint8).reshape(h, w)
+
+
+def _run_diffuse(*args):
+    """Diffuse with the compiled kernel, falling back to the interpreter.
+
+    Compilation can fail at the first CALL rather than at import - a stale or
+    unreadable on-disk cache raises there. Both paths produce the same bytes,
+    so falling back costs only time, which is much better than failing to draw
+    a frame. Demote once and stop trying.
+    """
+    global _diffuse, HAVE_NUMBA
+    try:
+        return _diffuse(*args)
+    except Exception as e:
+        if _diffuse is not _diffuse_py:
+            sys.stderr.write("dither: numba unavailable (%s); "
+                             "falling back to the interpreter\n" % e)
+            _diffuse, HAVE_NUMBA = _diffuse_py, False
+        return _diffuse_py(*args)
+
+
+def _diffuse_py(px, lut, pal, quant, lut_bits, lo, hi, h, w,
+                kdx, kdy, kwt, divisor):
+    """Error diffusion, one pixel at a time. See _diffuse for why it is here.
+
+    Strictly sequential: each pixel is quantised only after its neighbours have
+    pushed their error into it, so there is nothing to vectorise. The clamp is
+    applied per write and binds on a good fraction of them, which means even
+    reordering the additions would change the picture.
+    """
+    out = np.zeros(h * w, np.uint8)
+    stride = w * 3
+    shift2 = 2 * lut_bits
+    ntap = len(kwt)
     for y in range(h):
         rev = (y & 1) == 1
         base = y * stride
         for i in range(w):
             x = (w - 1 - i) if rev else i
             j = base + x * 3
-            r, g, b = px[j], px[j + 1], px[j + 2]
+            r = px[j]; g = px[j + 1]; b = px[j + 2]
             ir = 0 if r < 0 else (255 if r > 255 else int(r))
             ig = 0 if g < 0 else (255 if g > 255 else int(g))
             ib = 0 if b < 0 else (255 if b > 255 else int(b))
-            k = lutl[(Q[ir] << (2 * LB)) | (Q[ig] << LB) | Q[ib]]
-            outl[y * w + x] = k
-            pr, pg, pb = palr[k]
-            er, eg, eb = r - pr, g - pg, b - pb
-
-            tot = 0
-            for dx, dy, wt in ker:
-                nx, ny = x + (-dx if rev else dx), y + dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    tot += wt
-            if not tot:
-                continue
-            # Never normalise below the kernel's own divisor. Renormalising by
-            # the in-bounds sum amplifies at edges - on the bottom row floyd's
-            # single in-bounds tap would take 100% of the error instead of
-            # 43.8% and chain it along the row. Capping discards instead.
-            denom = tot if tot > divisor else divisor
-            for dx, dy, wt in ker:
-                nx, ny = x + (-dx if rev else dx), y + dy
+            k = lut[(quant[ir] << shift2) | (quant[ig] << lut_bits) | quant[ib]]
+            out[y * w + x] = k
+            er = r - pal[k, 0]; eg = g - pal[k, 1]; eb = b - pal[k, 2]
+            for t in range(ntap):
+                nx = x + (-kdx[t] if rev else kdx[t])
+                ny = y + kdy[t]
                 if 0 <= nx < w and 0 <= ny < h:
                     m = ny * stride + nx * 3
-                    f = wt / denom
+                    # Never normalise below the kernel's own divisor.
+                    # Renormalising by the in-bounds sum would amplify at the
+                    # edges - on the bottom row floyd's single remaining tap
+                    # would take 100% of the error instead of 43.8% and chain
+                    # it along the row. Capping discards the rest instead.
+                    f = kwt[t] / divisor
                     v = px[m] + er * f
-                    px[m] = LO if v < LO else (HI if v > HI else v)
+                    px[m] = lo if v < lo else (hi if v > hi else v)
                     v = px[m + 1] + eg * f
-                    px[m + 1] = LO if v < LO else (HI if v > HI else v)
+                    px[m + 1] = lo if v < lo else (hi if v > hi else v)
                     v = px[m + 2] + eb * f
-                    px[m + 2] = LO if v < LO else (HI if v > HI else v)
-    return np.array(outl, np.uint8).reshape(h, w)
+                    px[m + 2] = lo if v < lo else (hi if v > hi else v)
+    return out
+
+
+# The loop above is the whole cost of a render - about 90% of it, and the one
+# thing standing between a track change and the panel. numba compiles it to
+# roughly the speed a C extension would reach, without a build step.
+#
+# fastmath stays off and every value stays float64 on purpose: that is what
+# makes the compiled version produce the same bytes as the interpreter, so
+# whether numba is installed cannot change what appears on the glass. The
+# frame hashes in tests/baseline.py are what hold this to it.
+try:
+    from numba import njit as _njit
+    _diffuse = _njit(cache=True, fastmath=False)(_diffuse_py)
+    HAVE_NUMBA = True
+except Exception:      # not installed, or the cache directory is unwritable
+    _diffuse = _diffuse_py
+    HAVE_NUMBA = False
 
 
 def simulate(idx):

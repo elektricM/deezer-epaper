@@ -1,27 +1,40 @@
-// Fetch the current frame over WiFi and put it on the panel.
+// Pull the current frame over WiFi and put it on the glass.
 //
-// The firmware is flashed once and pulls frames for the rest of its life, so a
-// track change costs no rebuild and no cable.
+// This replaces baking the image into the firmware as a C array. That worked,
+// but cost a full recompile and USB re-flash for every single track - roughly
+// 13 s of build and upload before the 22 s refresh could even begin - and it
+// chained the panel to a cable. Here the firmware is flashed once and fetches
+// frames for the rest of its life.
 //
-// Long polling rather than interval polling: the server holds the request open
-// until the track changes, so a new song starts drawing about a second after it
-// begins. What remains is the ~20.5 s six-ink refresh, which is the panel.
+// Long polling, not interval polling. The panel asks for the frame and the
+// server HOLDS the request open until the track actually changes, so a new song
+// starts drawing about a second after it starts playing. Interval polling meant
+// waiting out the poll period first, on top of the refresh. What remains is the
+// refresh itself - 22.4 s measured, the full six-pigment waveform - and that is
+// physics, not something firmware can shorten.
 //
-// Plain HTTP, not HTTPS - the server is on the same LAN and mbedTLS costs about
-// 45 KB of heap this chip cannot spare.
+// Deliberately plain HTTP, not HTTPS. The server is the Mac on the same LAN,
+// and mbedTLS costs about 45 KB of heap this chip does not have to spare once a
+// 120 KB frame buffer and the WiFi stack are resident.
 //
-// Two constraints worth knowing:
-//   * the frame is never held in RAM. 120,000 bytes does not fit: the largest
-//     contiguous free block on an ESP32-D0WDQ6 is around 110,580, so bytes go
-//     from the socket to the panel through a small chunk buffer.
+// Two ordering constraints that are not obvious:
+//   * the frame is NEVER held in RAM. 120,000 bytes does not fit: on this
+//     ESP32-D0WDQ6 the largest contiguous free block at boot is 110,580,
+//     measured with the allocation done before anything else touched the heap.
+//     Free heap was never the problem, fragmentation was, so allocating earlier
+//     could not have helped. Bytes go from the socket to the panel as they
+//     arrive, through a small chunk buffer.
 //   * nothing reaches the glass until the refresh command, so a transfer that
-//     dies half way simply never triggers one.
+//     dies half way is harmless - it just never triggers a refresh.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+// No extern "C" here: the vendored driver is compiled as C++ (EPD_4in0e.cpp,
+// DEV_Config.cpp) and its header carries no linkage guards, so its symbols are
+// C++-mangled. Wrapping the include made the linker hunt for unmangled names.
 #include "EPD_4in0e.h"
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -32,6 +45,11 @@
 // than any NAT/router idle timeout, long enough that idle traffic is trivial.
 #define LONG_POLL_SECONDS 50
 #endif
+// The direct join either works almost at once or the hint is stale; waiting
+// the full timeout on it would make a stale hint cost more than it saves.
+#ifndef WIFI_FAST_MS
+#define WIFI_FAST_MS 6000
+#endif
 #ifndef WIFI_TIMEOUT_MS
 #define WIFI_TIMEOUT_MS 20000
 #endif
@@ -41,8 +59,91 @@
 #define CHUNK 2048          // small enough to always allocate, big enough to be quick
 
 static Preferences prefs;
+static String gBase;          // FRAME_URL with the host resolved to an address
+
+// True if addr is one we could actually route to: non-zero, and sharing the
+// subnet the DHCP lease put us on.
+static bool onOurSubnet(const IPAddress &addr) {
+  if (addr == IPAddress((uint32_t)0)) return false;
+  uint32_t mask = (uint32_t)WiFi.subnetMask();
+  if (!mask) return false;
+  return ((uint32_t)addr & mask) == ((uint32_t)WiFi.localIP() & mask);
+}
+
+// Resolve the host in FRAME_URL, so a DHCP change does not silently strand the
+// panel. A .local name is resolved by mDNS; the result is cached in NVS and
+// reused if mDNS later fails, and a literal IP in FRAME_URL is used as-is.
+//
+// A Mac publishes one A record per interface - loopback, VPNs and virtual
+// machine bridges included. This one answers with seven, only one of which is
+// reachable from here. queryHost() hands back whichever arrives first, so the
+// answer is checked against our own subnet before it is trusted, and only a
+// checked address is ever written to NVS. Caching an unreachable one would
+// strand the panel across reboots, which is the failure this whole function
+// exists to prevent.
+static String resolveBase() {
+  String url = FRAME_URL;
+  int hs = url.indexOf("//");
+  if (hs < 0) return url;
+  hs += 2;
+  int he = url.indexOf('/', hs);
+  if (he < 0) he = url.length();
+  String hostport = url.substring(hs, he);
+  int colon = hostport.indexOf(':');
+  String host = colon < 0 ? hostport : hostport.substring(0, colon);
+  String port = colon < 0 ? "" : hostport.substring(colon);
+
+  if (!host.endsWith(".local")) return url;      // literal address, nothing to do
+
+  String bare = host.substring(0, host.length() - 6);
+  IPAddress ip;
+  if (MDNS.begin("reframe-panel")) {
+    ip = MDNS.queryHost(bare, 4000);
+  }
+  if (!onOurSubnet(ip)) {
+    if (ip != IPAddress((uint32_t)0))
+      Serial.printf("ignoring %s, not on our subnet\n", ip.toString().c_str());
+    IPAddress cached;
+    if (cached.fromString(prefs.getString("hostip", "")) && onOurSubnet(cached)) {
+      Serial.printf("using cached %s\n", cached.toString().c_str());
+      return url.substring(0, hs) + cached.toString() + port + url.substring(he);
+    }
+    Serial.println("no usable address - keeping the name, will retry next cycle");
+    return url;
+  }
+  String addr = ip.toString();
+  if (addr != prefs.getString("hostip", "")) {
+    prefs.putString("hostip", addr);
+    Serial.printf("resolved %s -> %s\n", host.c_str(), addr.c_str());
+  }
+  return url.substring(0, hs) + addr + port + url.substring(he);
+}
 static uint8_t chunk[CHUNK];
 static String etag;
+
+// Wait for association, or give up. Polls often enough that the wait costs
+// little more than the association itself.
+static bool awaitLink(uint32_t timeout) {
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - t0 > timeout) return false;
+    delay(50);
+    if ((millis() - t0) % 500 < 50) Serial.print(".");
+  }
+  return true;
+}
+
+// Remember which access point answered, so the next join can go straight to it.
+static void rememberAp() {
+  uint8_t *b = WiFi.BSSID();
+  if (!b) return;
+  uint8_t known[6];
+  size_t n = prefs.getBytes("bssid", known, sizeof known);
+  if (n != sizeof known || memcmp(known, b, sizeof known) != 0)
+    prefs.putBytes("bssid", b, sizeof known);
+  if (prefs.getUChar("chan", 0) != WiFi.channel())
+    prefs.putUChar("chan", WiFi.channel());
+}
 
 static bool joinWifi() {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -50,20 +151,35 @@ static bool joinWifi() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > WIFI_TIMEOUT_MS) { Serial.println(" failed"); return false; }
-    delay(250);
-    Serial.print(".");
+
+  // A plain begin() scans every channel before it finds the AP, which is most
+  // of the join. Naming the AP and its channel skips the scan outright. The
+  // hint goes stale when the router reboots or the panel roams, so a failure
+  // here is expected occasionally and simply falls through to a full scan.
+  uint8_t bssid[6];
+  uint8_t chan = prefs.getUChar("chan", 0);
+  if (chan && prefs.getBytes("bssid", bssid, sizeof bssid) == sizeof bssid) {
+    WiFi.begin(WIFI_SSID, WIFI_PASS, chan, bssid);
+    if (awaitLink(WIFI_FAST_MS)) {
+      Serial.printf(" ok (direct, ch %u), ip %s, rssi %d\n",
+                    chan, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      return true;
+    }
+    Serial.print(" (ap moved)");
+    WiFi.disconnect(true);
   }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (!awaitLink(WIFI_TIMEOUT_MS)) { Serial.println(" failed"); return false; }
+  rememberAp();
   Serial.printf(" ok, ip %s, rssi %d\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   return true;
 }
 
-// On battery there is no serial cable, so record what happened and report it
-// on the next boot.
+// Why the panel died last time, in words. Running on a battery there is no
+// serial cable attached, so the only way to learn anything is for the board to
+// write down what happened and report it next time it is plugged in.
 static const char *resetReason(esp_reset_reason_t r) {
   switch (r) {
     case ESP_RST_POWERON:  return "power on";
@@ -80,7 +196,9 @@ static const char *resetReason(esp_reset_reason_t r) {
   }
 }
 
-// Coarse marker of what the board was doing when it last stopped.
+// Coarse marker of what the board was doing, so a supply that collapses during
+// the panel refresh - the heaviest moment - is distinguishable from one that
+// cannot even hold a WiFi association.
 static void mark(const char *stage) {
   prefs.putString("stage", stage);
 }
@@ -111,6 +229,8 @@ void setup() {
   Serial.printf("frame url: %s\n", FRAME_URL);
   mark("wifi connect");
   joinWifi();
+  gBase = resolveBase();
+  Serial.printf("fetching from: %s\n", gBase.c_str());
   mark("idle");
 }
 
@@ -118,7 +238,8 @@ void loop() {
   if (!joinWifi()) { delay(10000); return; }
 
   HTTPClient http;
-  String url = String(FRAME_URL) + "?wait=" + String(LONG_POLL_SECONDS);
+  if (!gBase.length()) gBase = resolveBase();
+  String url = gBase + "?wait=" + String(LONG_POLL_SECONDS);
   http.setConnectTimeout(8000);
   // Must outlast the server's hold, or we hang up on our own long poll - but
   // HTTPClient::setTimeout takes a uint16_t, so anything above 65535 ms wraps.
@@ -136,16 +257,17 @@ void loop() {
   int code = http.GET();
 
   if (code == 304) {
-    // Normal idle path, logged so a working panel is distinguishable from a
-    // hung one on the serial monitor.
+    // Normal idle path. Logged because otherwise a working panel is
+    // indistinguishable from a hung one on the serial monitor.
     Serial.printf("no change (held %lus)\n", (millis() - asked) / 1000);
     http.end();
     return;                                          // ask again at once
   }
   if (code == 204) { http.end(); delay(5000); return; }   // nothing playing
   if (code <= 0) {
-    Serial.printf("request failed (%d), backing off\n", code);
+    Serial.printf("request failed (%d), re-resolving and backing off\n", code);
     http.end();
+    gBase = "";          // the server may have moved; resolve again next cycle
     delay(5000);
     return;
   }
@@ -204,10 +326,13 @@ void loop() {
     return;
   }
 
-  // Radio off before the refresh. The frame is already in the controller's
-  // RAM, nothing needs the network for the next 20 s, and the refresh is the
-  // heaviest current draw in the cycle - leaving WiFi up through it browns out
-  // marginal supplies.
+  // Radio OFF before the refresh. The frame is already in the controller's RAM,
+  // so nothing needs the network for the next 20 seconds, and the refresh is
+  // the heaviest current draw in the cycle. Keeping WiFi associated through it
+  // was a regression: the first design powered the radio down before driving
+  // the panel, and long-polling quietly dropped that. Symptom was the board
+  // resetting a few seconds into the SECOND refresh - recorded as
+  // "last stage before this boot: refreshing" - on USB and on battery alike.
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
   delay(150);                         // let the supply recover before the load
@@ -218,8 +343,9 @@ void loop() {
   EPD_4IN0E_DisplayFinish();
   uint32_t took = millis() - t0;
   Serial.printf("refresh took %lu ms\n", took);
-  // A real refresh is ~20.5 s. Anything under a few seconds means the
-  // controller never got the frame, so do not record it as displayed.
+  // A real six-pigment refresh is ~20.5 s. Anything under a few seconds means
+  // the controller never got the frame and there was nothing to wait on, so the
+  // glass still shows the old image - do not record this frame as displayed.
   bool bogus = took < 5000;
   if (bogus) Serial.println("*** refresh returned far too fast - panel got no data");
   EPD_4IN0E_Sleep();

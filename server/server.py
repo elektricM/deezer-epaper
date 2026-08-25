@@ -46,6 +46,9 @@ _cfg = {"follow_any": False, "serve_lan": False, "method": "jarvis",
 _last = {"track": None, "at": 0.0}
 
 
+_cfg_lock = threading.Lock()
+
+
 def load_cfg():
     try:
         with open(CONFIG) as f:
@@ -55,12 +58,25 @@ def load_cfg():
 
 
 def save_cfg():
-    with open(CONFIG, "w") as f:
-        json.dump(_cfg, f, indent=2)
-    try:
-        os.chmod(CONFIG, 0o600)     # it holds an API key
-    except Exception:
-        pass
+    """Write the config atomically.
+
+    Truncating the real file first means a crash or two concurrent POSTs can
+    leave it half written, and load_cfg() swallows the parse error and silently
+    reverts to defaults. These values were arrived at by eye over eleven
+    covers; they are the only state here that cannot be regenerated, so the
+    write either lands whole or not at all.
+    """
+    tmp = CONFIG + ".tmp"
+    with _cfg_lock:
+        with open(tmp, "w") as f:
+            json.dump(_cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, CONFIG)
 
 
 def get_json(url, timeout=10):
@@ -333,7 +349,30 @@ _WINDOW_SCRIPT = (
 
 def deezer_window_title():
     """Deezer's window title, or (None, reason). Counts windows first, since
-    `front window` raises -1719 whenever Deezer is minimised or hidden."""
+    `front window` raises -1719 whenever Deezer is minimised or hidden.
+
+    Memoised for a beat: the long poll and the prerender loop both ask on the
+    same timer, so an uncached call meant two osascript processes and about
+    150 ms of work every two seconds, for as long as a browser held the
+    now-playing slot. The window cannot change faster than the poll notices
+    anyway.
+    """
+    now = time.time()
+    with _win_lock:
+        if _win_cache["at"] > now - WINDOW_TITLE_TTL:
+            return _win_cache["val"]
+    val = _deezer_window_title_uncached()
+    with _win_lock:
+        _win_cache.update(at=time.time(), val=val)
+    return val
+
+
+WINDOW_TITLE_TTL = 1.5
+_win_lock = threading.Lock()
+_win_cache = {"at": 0.0, "val": (None, None)}
+
+
+def _deezer_window_title_uncached():
     try:
         p = subprocess.run(["osascript", "-e", _WINDOW_SCRIPT],
                            capture_output=True, text=True, timeout=5)
@@ -688,8 +727,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        # Origin check: the page is served from localhost, so anything else
-        # posting here is a browser being used as a confused deputy.
+        # Writes are loopback-only. The Origin check alone stops a browser
+        # being used as a confused deputy, but anything that is not a browser
+        # simply omits the header - so with serve_lan on, the whole network
+        # could POST new dithering settings, or turn serve_lan itself off. The
+        # tuning page and the menu bar app are both local.
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return self._json({"error": "local requests only"}, 403)
         origin = self.headers.get("Origin")
         if origin and not (origin.startswith("http://localhost:")
                            or origin.startswith("http://127.0.0.1:")):

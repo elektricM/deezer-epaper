@@ -1,6 +1,16 @@
-// Menu bar front end: spawns the server and shows what it reports.
+// Menu bar front end for the Deezer now-playing watcher.
 //
-// LSUIElement is set, so there is no Dock icon.
+// This is the bundle's executable. It spawns server/server.py as a child and
+// shows what that reports.
+//
+// It used to matter that the server was a child of this bundle, because the old
+// track source read the Deezer window title through AppleScript and macOS
+// attributes Accessibility grants per binary. That source is gone: the track now
+// comes from MediaRemote, which needs no permission at all, so the parent/child
+// relationship is only about lifetime management now.
+//
+// LSUIElement is set, so there is no Dock icon - it lives in the menu bar as a
+// background app, which is what it is.
 
 import Cocoa
 import Foundation
@@ -14,11 +24,16 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var lastTitle = ""
     private var lastArtist = ""
     private var lastState = ""
+    /// Set while we are killing the server on purpose, so the termination
+    /// handler can tell an intentional stop from a crash.
+    private var stopping = false
+    /// Launch times of recent unplanned restarts, for the crash-loop guard.
+    private var restarts: [Date] = []
     private var lastDetail = ""
     private var serveLAN = false          // is the frame endpoint reachable by the panel?
     private var lanAddress: String?       // this Mac's LAN IP, for the panel URL
-    // Icon only by default - a long track name crowds the bar enough that
-    // macOS starts hiding items.
+    // Icon only by default. A 40-character track name crowded the menu bar so
+    // hard that macOS started hiding items outright - including this one.
     private var showTitle = UserDefaults.standard.object(forKey: "showTitle") as? Bool ?? false
     private var followAny = false
 
@@ -36,7 +51,8 @@ final class Controller: NSObject, NSApplicationDelegate {
                               accessibilityDescription: "Now Playing")
             img?.isTemplate = true
             b.image = img
-            // With neither image nor title the button has zero width.
+            // Fall back to a glyph if the symbol is unavailable, or the button
+            // has neither image nor title and collapses to nothing.
             if img == nil { b.title = "♪" }
         }
         rebuildMenu()
@@ -49,13 +65,16 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     // MARK: - server lifecycle
 
-    /// Clear anything squatting on the port before binding it. An orphaned
-    /// server keeps the socket while no longer answering, which otherwise
-    /// leaves the menu stuck on "Starting…" with no explanation.
+    /// Clear anything squatting on our port before binding it.
+    ///
+    /// Orphaned servers are a real failure mode, not a theoretical one: a
+    /// previous instance, or a stray started by something else, keeps the socket
+    /// but stops answering. Without this the app binds nothing, dies silently,
+    /// and the menu sits on "Starting…" forever with no clue why.
     private func clearPort() {
         let k = Process()
         k.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        k.arguments = ["-9", "-f", "tools/nowplaying.py"]
+        k.arguments = ["-9", "-f", "server/server.py"]
         k.standardOutput = FileHandle.nullDevice
         k.standardError = FileHandle.nullDevice
         try? k.run()
@@ -65,9 +84,9 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     private func startServer() {
         clearPort()
-        let script = root + "/tools/nowplaying.py"
+        let script = root + "/server/server.py"
         guard FileManager.default.fileExists(atPath: script) else {
-            lastState = "tools/nowplaying.py not found"
+            lastState = "server/server.py not found"
             rebuildMenu()
             return
         }
@@ -75,25 +94,83 @@ final class Controller: NSObject, NSApplicationDelegate {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = [script, "--port", String(PORT)]
         p.currentDirectoryURL = URL(fileURLWithPath: root)
-        // Discard output: an unread pipe would block the child once full.
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        // Append to a log rather than discarding. The menu can only show the
+        // last state; when the server dies of a traceback that state is the
+        // one thing that does not explain why. A file cannot block the child
+        // the way an unread pipe would.
+        if let log = logHandle() {
+            p.standardOutput = log
+            p.standardError = log
+        } else {
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+        }
         do { try p.run(); server = p } catch {
             lastState = "could not start server"
             rebuildMenu()
             return
         }
-        // If it exits immediately, say so rather than polling a corpse.
+        // A dead server used to stay dead: the menu said so and nothing acted
+        // on it, so the panel kept re-fetching a refused port and held its last
+        // image until somebody noticed the glyph. Bring it back instead, and
+        // stop only if it is failing so fast that restarting cannot help.
         p.terminationHandler = { [weak self] proc in
             guard let self = self else { return }
             DispatchQueue.main.async {
-                if self.server === proc {
-                    self.lastTitle = ""; self.lastArtist = ""
-                    self.lastState = "server stopped (exit \(proc.terminationStatus))"
+                guard self.server === proc, !self.stopping else { return }
+                self.lastTitle = ""; self.lastArtist = ""
+                let code = proc.terminationStatus
+                self.note("server exited (\(code))")
+
+                let now = Date()
+                self.restarts = self.restarts.filter { now.timeIntervalSince($0) < 60 }
+                self.restarts.append(now)
+                if self.restarts.count > 5 {
+                    // Five deaths in a minute is a fault a restart will not
+                    // clear; looping on it would just bury the reason.
+                    self.lastState = "server keeps exiting (\(code)) - see log"
+                    self.note("giving up after 5 restarts in 60 s")
                     self.updateButton(); self.rebuildMenu()
+                    return
+                }
+                let delay = min(8.0, pow(2.0, Double(self.restarts.count - 1)))
+                self.lastState = "server stopped (\(code)), restarting…"
+                self.updateButton(); self.rebuildMenu()
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    guard self.server === proc, !self.stopping else { return }
+                    self.startServer()
                 }
             }
         }
+    }
+
+    /// Append-only log next to every other app log on the machine.
+    private func logHandle() -> FileHandle? {
+        let dir = FileManager.default.urls(for: .libraryDirectory,
+                                           in: .userDomainMask)[0]
+            .appendingPathComponent("Logs")
+        let url = dir.appendingPathComponent("NowPlaying.log")
+        try? FileManager.default.createDirectory(at: dir,
+                                                 withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        guard let h = try? FileHandle(forWritingTo: url) else { return nil }
+        // Keep it from growing without bound across months of uptime.
+        if (try? h.seekToEnd()).map({ $0 > 2_000_000 }) == true {
+            try? h.truncate(atOffset: 0)
+        }
+        return h
+    }
+
+    /// One line in the log, so the supervisor's own decisions are visible too.
+    private func note(_ msg: String) {
+        guard let h = logHandle() else { return }
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        _ = try? h.seekToEnd()
+        h.write("[\(f.string(from: Date()))] menubar: \(msg)\n".data(using: .utf8)!)
+        try? h.close()
     }
 
     @objc private func restartServer() {
@@ -103,6 +180,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     private func stopServerProcess() {
+        stopping = true
+        defer { stopping = false }
         guard let p = server, p.isRunning else { return }
         p.terminationHandler = nil
         p.terminate()
@@ -152,8 +231,10 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     private func updateButton() {
         guard let b = item.button else { return }
-        // Menu bar space is shared and finite: title only, hard-capped, and
-        // switchable off entirely. The full track is in the menu.
+        // imagePosition must track whether there is a title. With .imageLeading
+        // and an empty title AppKit lays the button out for text it does not
+        // have and collapses it to zero width, so the item is invisible while
+        // the app carries on working.
         if !showTitle || lastTitle.isEmpty {
             b.title = ""
             b.imagePosition = b.image == nil ? .noImage : .imageOnly
@@ -194,8 +275,14 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         m.addItem(.separator())
         m.addItem(menuItem("Open Now Playing", #selector(openUI)))
-        // The panel follows playback by itself over WiFi; there is nothing
-        // here to press.
+        // "Send to Panel" and "Follow Playback on Panel" used to live here.
+        // Both drove the legacy USB path, which compiles the image into the
+        // firmware and re-flashes the board - which overwrites the WiFi
+        // firmware the panel now runs on. With the two of them active at once
+        // the panel flipped between the two designs and appeared broken: it
+        // would draw once, then stop, and on battery never update at all
+        // because the USB firmware has nothing to fetch from. The panel now
+        // follows playback by itself, so there is nothing here to press.
         let lan = toggleItem("Serve Frames over Wi\u{2011}Fi", #selector(toggleLAN),
                              on: serveLAN)
         lan.toolTip = serveLAN
@@ -241,9 +328,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         return i
     }
 
-    /// A menu item that reads as a switch in both positions. macOS draws a
-    /// checkmark for .on and nothing for .off, so an off toggle would otherwise
-    /// look like an ordinary command.
+    /// A menu item that reads as a switch whether it is on or off.
+    ///
+    /// macOS draws a checkmark for .on and NOTHING for .off, so a pair of
+    /// toggles that both happen to be off looks like two ordinary commands -
+    /// which is exactly how it was reported. Giving the off state its own glyph
+    /// makes the control legible in both positions.
     private func toggleItem(_ title: String, _ sel: Selector, on: Bool) -> NSMenuItem {
         let i = menuItem(title, sel)
         i.state = on ? .on : .off
@@ -260,9 +350,11 @@ final class Controller: NSObject, NSApplicationDelegate {
 
 
 
-    /// Let the panel reach this Mac over the network. Off by default: turning
-    /// it on binds every interface, putting the current track and the rendered
-    /// frame on the local network.
+    /// Let the panel reach this Mac over the network.
+    ///
+    /// Off by default and deliberately explicit: turning it on binds the server
+    /// to every interface, which puts the current track and the rendered frame
+    /// on the local network. That is the user's call to make, not a default.
     @objc private func toggleLAN() {
         let want = !serveLAN
         guard let url = URL(string: "http://127.0.0.1:\(PORT)/config") else { return }
@@ -297,8 +389,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         }.resume()
     }
 
-    /// Deezer-only, or whatever is playing. Deezer-only by default so a
-    /// browser video does not take over the panel.
+    /// Deezer-only, or whatever is playing.
+    ///
+    /// Deezer-only is the default: this panel exists to show album art, and a
+    /// browser video taking the audio session should not take the wall with it.
     @objc private func toggleAny() {
         let want = !followAny
         guard let url = URL(string: "http://127.0.0.1:\(PORT)/config") else { return }

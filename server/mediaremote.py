@@ -40,6 +40,10 @@ def _perl_argv(mode):
     return [_PERL, "-e",
             'use DynaLoader; DynaLoader::dl_load_file($ARGV[0],0) or die "load failed";'
             'select(undef,undef,undef,$ARGV[1]);', _LIB,
+            # An upper bound on how long perl lingers, not the mechanism that
+            # ends it: an adapter whose reader has gone dies within a tick, on
+            # SIGPIPE from the keepalive in emit(). Shortening this instead
+            # would respawn the adapter all day for no gain.
             "3600" if mode == "stream" else "8"]
 
 
@@ -140,22 +144,32 @@ class Watcher:
             try:
                 self._proc = subprocess.Popen(
                     _perl_argv("stream"), stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+                    stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
+                    # strict decoding would raise on a multi-byte sequence cut
+                    # short by the adapter dying mid-write, and that raise is
+                    # outside the try below: the thread would die and the
+                    # server would keep answering with a frozen track forever.
+                    errors="replace")
             except Exception as e:
                 self._set({"state": "adapter failed to start", "detail": str(e)})
                 self._stop.wait(min(60, backoff)); backoff *= 2
                 continue
             backoff = 1.0
-            for line in self._proc.stdout:
-                if self._stop.is_set():
-                    break
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    self._set(json.loads(line))
-                except ValueError:
-                    pass
+            try:
+                for line in self._proc.stdout:
+                    if self._stop.is_set():
+                        break
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        self._set(json.loads(line))
+                    except ValueError:
+                        pass
+            except Exception as e:
+                # Whatever went wrong reading the pipe, restarting is better
+                # than losing the thread and freezing on the last track.
+                self._set({"state": "adapter read failed", "detail": str(e)[:200]})
             if self._stop.is_set():
                 break
             # The adapter exited. Restart it, but do not spin.
