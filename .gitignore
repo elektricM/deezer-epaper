@@ -21,3 +21,6 @@ sheets/
 
 # Local tests, not shipped
 tests/
+
+# Built on first use from diffuse.c
+server/diffuse/*.so

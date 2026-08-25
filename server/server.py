@@ -157,6 +157,11 @@ def _lan_ip():
         s.close()
 
 
+# Whether a rendered frame actually had its cover, keyed by ETag. Bounded:
+# only the last few matter, and an unknown key is treated as complete.
+_frame_complete = {}
+
+
 def render_frame(track, want_png=False):
     """Packed frame plus its ETag, re-rendering only when the track changes."""
     key = (track.get("id"), want_png,
@@ -188,6 +193,9 @@ def render_frame(track, want_png=False):
     else:
         body = panel.pack(idx)
     etag = '"%08x"' % (zlib.crc32(body) & 0xFFFFFFFF)
+    if len(_frame_complete) > 32:
+        _frame_complete.clear()      # only the most recent frames matter
+    _frame_complete[etag] = complete
     if complete:
         # Only cache a frame that has its artwork, so a CDN hiccup does not pin
         # a text-only card until the song changes.
@@ -725,7 +733,14 @@ class Handler(BaseHTTPRequestHandler):
             track = st.get("track")
             body, etag = (render_frame(track, u.path.endswith(".png"))
                           if track else (None, None))
-            if not wait or inm is None or etag != inm or time.time() >= deadline:
+            # An artwork-less card is nearly white, and pushing it costs the
+            # panel a full 20 s refresh - then the real cover arrives and costs
+            # another. Keep waiting for the picture instead; if the cover truly
+            # cannot be fetched, the deadline still lets the card through so a
+            # missing cover degrades to text rather than to nothing.
+            ready = etag is None or _frame_complete.get(etag, True)
+            if not wait or inm is None or (etag != inm and ready) \
+                    or time.time() >= deadline:
                 break
             # Park until MediaRemote reports a change. When the track comes
             # from Deezer's window, MediaRemote is watching a different app and
@@ -1194,8 +1209,13 @@ function drawPigs(){
   });
 }
 function preview(){
+  // Every stage the server reads has to be sent. brightness, neutral and
+  // black_point were missing here, so the server fell back to their defaults
+  // and those three sliders moved without changing the picture.
   const q=new URLSearchParams({method:cur.method,contrast:eff('contrast'),
     saturate:eff('saturate'),chroma:eff('chroma'),gamut:eff('gamut'),
+    brightness:eff('brightness'),neutral:eff('neutral'),
+    black_point:eff('black_point'),
     pal:palParam(), art:$('art').checked?'1':'0', _:Date.now()});
   const out=$('out'); out.classList.add('busy');
   const n=new Image();

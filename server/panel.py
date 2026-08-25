@@ -318,7 +318,7 @@ def _run_diffuse(*args):
         return _diffuse(*args)
     except Exception as e:
         if _diffuse is not _diffuse_py:
-            sys.stderr.write("dither: numba unavailable (%s); "
+            sys.stderr.write("dither: compiled kernel unusable (%s); "
                              "falling back to the interpreter\n" % e)
             _diffuse, HAVE_NUMBA = _diffuse_py, False
         return _diffuse_py(*args)
@@ -371,20 +371,79 @@ def _diffuse_py(px, lut, pal, quant, lut_bits, lo, hi, h, w,
 
 
 # The loop above is the whole cost of a render - about 90% of it, and the one
-# thing standing between a track change and the panel. numba compiles it to
-# roughly the speed a C extension would reach, without a build step.
+# thing standing between a track change and the panel. Compiled, it drops from
+# roughly 370 ms to 4 ms.
 #
-# fastmath stays off and every value stays float64 on purpose: that is what
-# makes the compiled version produce the same bytes as the interpreter, so
-# whether numba is installed cannot change what appears on the glass. The
-# frame hashes in tests/baseline.py are what hold this to it.
+# The compiler is cc, invoked on first use exactly as the MediaRemote adapter
+# builds its dylib. numba reaches the same speed with less code, but it keeps
+# its whole compiler stack resident: on this server it cost 87 MB of steady
+# memory against about 200 KB for this. On a machine that also has to hold a
+# menu bar app and a browser, that is the wrong trade for the same result.
+#
+# The C is a transcription, not a reimplementation: same order, same clamps,
+# same truncating cast, and built without -ffast-math. That is what makes the
+# compiled path produce the same bytes as the interpreter, so whether the
+# build succeeded cannot change what appears on the glass. The frame hashes in
+# tests/baseline.py hold it to that.
+_DIFFUSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diffuse")
+_DIFFUSE_SO = os.path.join(_DIFFUSE_DIR, "diffuse.so")
+
+
+def build_diffuse(force=False):
+    """Compile the kernel if it is missing or older than its source."""
+    src = os.path.join(_DIFFUSE_DIR, "diffuse.c")
+    if not os.path.exists(src):
+        return False
+    if (not force and os.path.exists(_DIFFUSE_SO)
+            and os.path.getmtime(_DIFFUSE_SO) >= os.path.getmtime(src)):
+        return True
+    import subprocess
+    subprocess.run(["cc", "-O3", "-fPIC", "-shared", "-o", _DIFFUSE_SO, src],
+                   check=True, capture_output=True)
+    return True
+
+
+def _load_diffuse():
+    import ctypes
+    if not build_diffuse():
+        return None
+    lib = ctypes.CDLL(_DIFFUSE_SO)
+    f = lib.diffuse
+    d, l, u = ctypes.c_double, ctypes.c_long, ctypes.c_ubyte
+    p = np.ctypeslib.ndpointer
+    f.restype = None
+    f.argtypes = [p(np.float64, flags="C_CONTIGUOUS"),
+                  p(np.int64, flags="C_CONTIGUOUS"),
+                  p(np.float64, flags="C_CONTIGUOUS"),
+                  p(np.int64, flags="C_CONTIGUOUS"),
+                  l, d, d, l, l,
+                  p(np.int64, flags="C_CONTIGUOUS"),
+                  p(np.int64, flags="C_CONTIGUOUS"),
+                  p(np.float64, flags="C_CONTIGUOUS"),
+                  l, d,
+                  p(np.uint8, flags="C_CONTIGUOUS")]
+    return f
+
+
+def _diffuse_c(px, lut, pal, quant, lut_bits, lo, hi, h, w,
+               kdx, kdy, kwt, divisor):
+    out = np.zeros(h * w, np.uint8)
+    _CFUNC(np.ascontiguousarray(px), np.ascontiguousarray(lut),
+           np.ascontiguousarray(pal.reshape(-1)), np.ascontiguousarray(quant),
+           lut_bits, lo, hi, h, w,
+           np.ascontiguousarray(kdx), np.ascontiguousarray(kdy),
+           np.ascontiguousarray(kwt), len(kwt), divisor, out)
+    return out
+
+
 try:
-    from numba import njit as _njit
-    _diffuse = _njit(cache=True, fastmath=False)(_diffuse_py)
-    HAVE_NUMBA = True
-except Exception:      # not installed, or the cache directory is unwritable
+    _CFUNC = _load_diffuse()
+    _diffuse = _diffuse_c if _CFUNC else _diffuse_py
+    HAVE_FAST_DIFFUSE = _CFUNC is not None
+except Exception:      # no compiler, unwritable directory, anything else
+    _CFUNC = None
     _diffuse = _diffuse_py
-    HAVE_NUMBA = False
+    HAVE_FAST_DIFFUSE = False
 
 
 def simulate(idx):

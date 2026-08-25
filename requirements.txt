@@ -1,7 +1,2 @@
 numpy>=1.24
 Pillow>=10.0
-
-# Optional. Compiles the error-diffusion loop, which is otherwise ~90% of a
-# render: 376 ms drops to about 13 ms. Both paths produce identical frames, so
-# leaving this out costs speed and nothing else.
-numba>=0.58
