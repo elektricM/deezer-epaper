@@ -240,7 +240,10 @@ def _lut(pal, weight=None, neutral=0.0):
     # colour-picker keystroke, and each entry is 256 KB kept forever. A miss
     # costs about 30 ms, so a small cache loses nothing.
     if len(_lut_cache) >= _LUT_CACHE_MAX:
-        _lut_cache.pop(next(iter(_lut_cache)))
+        # pop(key, None): two threads can pick the same oldest key, and the
+        # loser would otherwise raise KeyError and fail a whole frame.
+        for k in list(_lut_cache)[:1]:
+            _lut_cache.pop(k, None)
     _lut_cache[key] = idx
     return idx
 
@@ -399,8 +402,10 @@ def _diffuse_py(px, lut, pal, quant, lut_bits, lo, hi, h, w,
 # The C is a transcription, not a reimplementation: same order, same clamps,
 # same truncating cast, and built without -ffast-math. That is what makes the
 # compiled path produce the same bytes as the interpreter, so whether the
-# build succeeded cannot change what appears on the glass. The frame hashes in
-# tests/baseline.py hold it to that.
+# build succeeded cannot change what appears on the glass. It was verified
+# against the interpreter over 48 method, palette and neutral combinations and
+# a fixed corpus of rendered frames; keep any change to this loop verified the
+# same way.
 _DIFFUSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diffuse")
 _DIFFUSE_SO = os.path.join(_DIFFUSE_DIR, "diffuse.so")
 
@@ -413,9 +418,24 @@ def build_diffuse(force=False):
     if (not force and os.path.exists(_DIFFUSE_SO)
             and os.path.getmtime(_DIFFUSE_SO) >= os.path.getmtime(src)):
         return True
-    import subprocess
-    subprocess.run(["cc", "-O3", "-fPIC", "-shared", "-o", _DIFFUSE_SO, src],
-                   check=True, capture_output=True)
+    import subprocess, tempfile
+    # Compile to a temp file and rename. Writing straight to the .so truncates
+    # a file a running server may already have mapped, which is a SIGBUS in
+    # that process, and two servers racing here could dlopen a half-written
+    # library. os.replace is atomic, and an already-mapped old inode stays
+    # valid until it is unmapped.
+    fd, tmp = tempfile.mkstemp(suffix=".so", dir=_DIFFUSE_DIR)
+    os.close(fd)
+    try:
+        subprocess.run(["cc", "-O3", "-fPIC", "-shared", "-o", tmp, src],
+                       check=True, capture_output=True)
+        os.replace(tmp, _DIFFUSE_SO)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return True
 
 

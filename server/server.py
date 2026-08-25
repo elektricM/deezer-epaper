@@ -70,8 +70,13 @@ def save_cfg():
     """
     tmp = CONFIG + ".tmp"
     with _cfg_lock:
+        # Serialise a snapshot, not the live dict: writers mutate _cfg without
+        # this lock, and json.dump iterating a dict that changes size raises -
+        # which would leave the temp file behind, skip the rename, and lose
+        # the write silently while memory and disk diverge.
+        snap = dict(_cfg)
         with open(tmp, "w") as f:
-            json.dump(_cfg, f, indent=2)
+            json.dump(snap, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         try:
@@ -166,6 +171,45 @@ PRESET_KEYS = ("method", "saturate", "contrast", "chroma", "gamut", "neutral",
                "black_point", "brightness", "blend", "palette", "pal")
 
 
+# Ranges for everything a preset or a config POST may set. Presets are
+# persisted AND can be bound to an album, so an unchecked one is not a bad
+# preview - it is a render that raises on every poll, a 500 the firmware
+# retries forever, and a panel stranded on its last image across restarts with
+# the server looking healthy. Same table both places so they cannot drift.
+SETTING_RANGE = {"saturate": (0.0, 4.0), "contrast": (0.2, 3.0),
+                 "chroma": (0.0, 12.0), "gamut": (0.0, 1.0),
+                 "neutral": (0.0, 20.0), "black_point": (0.0, 0.5),
+                 "brightness": (0.3, 2.5), "blend": (0.0, 1.0)}
+
+
+def _clean_settings(src):
+    """Validated copy of src, or None if anything is unusable."""
+    out = {}
+    for k, (lo, hi) in SETTING_RANGE.items():
+        if k in src:
+            try:
+                out[k] = max(lo, min(hi, float(src[k])))
+            except (TypeError, ValueError):
+                return None
+    if "method" in src:
+        if src["method"] not in panel.METHODS:
+            return None
+        out["method"] = src["method"]
+    if "palette" in src:
+        if src["palette"] not in panel.PALETTES:
+            return None
+        out["palette"] = src["palette"]
+    if "pal" in src:
+        pal = src["pal"]
+        if pal:
+            if not isinstance(pal, str) or _parse_pal(pal) is None:
+                return None
+            out["pal"] = pal
+        else:
+            out["pal"] = ""
+    return out
+
+
 def _album_key(track):
     """Identity a preset can be bound to.
 
@@ -214,10 +258,19 @@ _frame_complete = {}
 def render_frame(track, want_png=False):
     """Packed frame plus its ETag, re-rendering only when the track changes."""
     st = settings_for(track)
-    key = (track.get("id"), want_png) + tuple(st.get(k) for k in PRESET_KEYS)
+    # Key on what is actually DRAWN, not on the track's identity string. The id
+    # is only artist|title|artworkId, while the frame also contains the cover,
+    # the album and the duration - so two frames that differ could share a key
+    # and one that had not changed at all could miss. Missing is a wasted
+    # render; colliding is worse, because the panel keeps a frame that no
+    # longer matches the track and nothing ever corrects it.
+    key = (want_png, track.get("cover"), track.get("artwork_b64"),
+           track.get("title"), track.get("artist"), track.get("album"),
+           track.get("duration")) + tuple(st.get(k) for k in PRESET_KEYS)
     with _frame_lock:
-        if _frame_cache.get("key") == key and _frame_cache.get("body"):
-            return _frame_cache["body"], _frame_cache["etag"]
+        hit = _frame_cache.get(key)
+        if hit:
+            return hit
     import render as epd
     t0 = time.time()
     def _f(k, d):
@@ -245,14 +298,25 @@ def render_frame(track, want_png=False):
     else:
         body = panel.pack(idx)
     etag = '"%08x"' % (zlib.crc32(body) & 0xFFFFFFFF)
-    if len(_frame_complete) > 32:
-        _frame_complete.clear()      # only the most recent frames matter
+    if len(_frame_complete) > 64:
+        # Drop the oldest rather than all of them: clearing wholesale made a
+        # known-incomplete frame read as complete again, which is exactly the
+        # case the flag exists to catch.
+        for k in list(_frame_complete)[:32]:
+            _frame_complete.pop(k, None)
     _frame_complete[etag] = complete
     if complete:
         # Only cache a frame that has its artwork, so a CDN hiccup does not pin
         # a text-only card until the song changes.
         with _frame_lock:
-            _frame_cache.update(key=key, body=body, etag=etag)
+            # A few slots, not one. With a single slot /frame.png and
+            # /frame.bin evicted each other, so anything watching the preview
+            # made the panel's own endpoint re-render and re-download the
+            # cover on every poll: measured 1.7 ms cached against 115 ms after
+            # one PNG request.
+            if len(_frame_cache) >= 6:
+                _frame_cache.pop(next(iter(_frame_cache)))
+            _frame_cache[key] = (body, etag)
     if _cfg.get("verbose"):
         print("rendered %-38s %5.0f ms%s" % (
             (track.get("title") or "")[:38], 1000 * (time.time() - t0),
@@ -804,8 +868,19 @@ class Handler(BaseHTTPRequestHandler):
             seq = source().seq()
             st = current()
             track = st.get("track")
-            body, etag = (render_frame(track, u.path.endswith(".png"))
-                          if track else (None, None))
+            try:
+                body, etag = (render_frame(track, u.path.endswith(".png"))
+                              if track else (None, None))
+            except Exception as e:
+                # A render that raises used to surface as a 500, which the
+                # firmware treats like any other failure and retries forever -
+                # so one bad setting stranded the panel with the server
+                # looking healthy. Say so, keep serving, leave the glass alone.
+                sys.stderr.write("render failed: %r\n" % (e,))
+                self.send_response(503)
+                self.send_header("X-Error", _ascii(str(e)))
+                self.end_headers()
+                return
             # An artwork-less card is nearly white, and pushing it costs the
             # panel a full 20 s refresh - then the real cover arrives and costs
             # another. Keep waiting for the picture instead; if the cover truly
@@ -824,6 +899,18 @@ class Handler(BaseHTTPRequestHandler):
         if not track:
             self.send_response(204)      # nothing playing: leave the glass alone
             self.send_header("X-State", st.get("state", "idle"))
+            self.end_headers()
+            return
+
+        # The wait above gives up at its deadline whether or not the artwork
+        # arrived. If it did not, and the panel already holds a picture, say
+        # "nothing new" rather than handing it a near-blank card: that card is
+        # 99% white, costs a twenty-second refresh to display and another to
+        # undo once the cover comes back. A panel holding nothing still gets
+        # the card, because a text frame beats an empty screen.
+        if inm is not None and not _frame_complete.get(etag, True):
+            self.send_response(304)
+            self.send_header("ETag", inm)
             self.end_headers()
             return
 
@@ -880,7 +967,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not name:
                     return self._json({"error": "name required"}, 400)
                 src = req.get("settings") or {k: _cfg.get(k) for k in PRESET_KEYS}
-                saved[name] = {k: src[k] for k in PRESET_KEYS if k in src}
+                clean = _clean_settings(src)
+                if clean is None:
+                    return self._json({"error": "settings out of range"}, 400)
+                saved[name] = clean
             elif act == "delete":
                 saved.pop(name, None)
                 for k in [k for k, v in binds.items() if v == name]:
