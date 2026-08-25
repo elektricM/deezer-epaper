@@ -3,15 +3,22 @@
 // This is the bundle's executable. It spawns server/server.py as a child and
 // shows what that reports.
 //
-// It used to matter that the server was a child of this bundle, because the old
-// track source read the Deezer window title through AppleScript and macOS
-// attributes Accessibility grants per binary. That source is gone: the track now
-// comes from MediaRemote, which needs no permission at all, so the parent/child
-// relationship is only about lifetime management now.
+// The server runs as a child of this bundle, and that still matters. macOS
+// exposes only ONE now-playing client at a time, so whenever a browser plays a
+// video Deezer becomes invisible to MediaRemote. The fallback reads Deezer's
+// own window title through AppleScript, which needs Accessibility - and macOS
+// attributes that grant to the responsible process, which is this bundle. So
+// this app asks for the permission, and the child inherits the ability to use
+// it.
+//
+// The grant is keyed to this binary's code-signature hash. The app is ad-hoc
+// signed, so REBUILDING IT REVOKES THE PERMISSION and it has to be granted
+// again. That is why the prompt below exists rather than a line in a README.
 //
 // LSUIElement is set, so there is no Dock icon - it lives in the menu bar as a
 // background app, which is what it is.
 
+import ApplicationServices
 import Cocoa
 import Foundation
 
@@ -29,6 +36,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var stopping = false
     /// Launch times of recent unplanned restarts, for the crash-loop guard.
     private var restarts: [Date] = []
+    /// Whether we have already asked for Accessibility this launch.
+    private var askedForAccessibility = false
     private var lastDetail = ""
     private var serveLAN = false          // is the frame endpoint reachable by the panel?
     private var lanAddress: String?       // this Mac's LAN IP, for the panel URL
@@ -144,6 +153,34 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Ask for Accessibility the way any other app does: the system prompt,
+    /// which carries its own "Open System Settings" button.
+    ///
+    /// Nothing can grant this on the user's behalf - that is the point of the
+    /// permission - but the asking is worth automating, because the symptom
+    /// otherwise reads as "nothing is playing" rather than "a permission is
+    /// missing". macOS shows the prompt only once per binary, so if it has
+    /// already been dismissed we open the pane directly instead.
+    private func requestAccessibility() {
+        guard !askedForAccessibility else { return }
+        askedForAccessibility = true
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        if AXIsProcessTrustedWithOptions([key: true] as CFDictionary) {
+            return                                  // already granted
+        }
+        note("accessibility not granted; prompted")
+        // The prompt is fire-and-forget and may not appear. Give it a moment,
+        // then open the pane so there is always somewhere to go.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self = self, !AXIsProcessTrusted() else { return }
+            self.note("opening the Accessibility pane")
+            if let u = URL(string: "x-apple.systempreferences:"
+                           + "com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(u)
+            }
+        }
+    }
+
     /// Append-only log next to every other app log on the machine.
     private func logHandle() -> FileHandle? {
         let dir = FileManager.default.urls(for: .libraryDirectory,
@@ -223,6 +260,11 @@ final class Controller: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.lastTitle = title; self.lastArtist = artist
                 self.lastState = state; self.lastDetail = detail
+                // The server only reports this once it has actually tried to
+                // read Deezer's window and been refused, so it is the right
+                // moment to ask - rather than prompting at launch for a
+                // permission that may never be needed.
+                if state == "needs_accessibility" { self.requestAccessibility() }
                 self.updateButton(); self.rebuildMenu()
             }
         }.resume()
@@ -317,6 +359,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         case "held":         return "Last played"
         case "idle":         return "Nothing playing"
         case "other":        return lastDetail.isEmpty ? "Another app has the audio" : lastDetail
+        case "needs_accessibility":
+                             return "Needs Accessibility permission"
         case "starting", "": return "Starting…"
         default:             return lastState
         }

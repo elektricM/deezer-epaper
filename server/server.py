@@ -259,7 +259,8 @@ def current():
 
     bundle = st.get("bundleId") or ""
     players = st.get("players") or []
-    deezer_present = any(_is_deezer(p.get("bundleId")) for p in players)
+    deezer_present = (any(_is_deezer(p.get("bundleId")) for p in players)
+                      or _deezer_app_running())
     follow_any = bool(_cfg.get("follow_any"))
 
     if state in ("playing", "paused") and (follow_any or _is_deezer(bundle)):
@@ -345,6 +346,34 @@ _WINDOW_SCRIPT = (
     '  end tell\n'
     '  return "__NOWINDOW__"\n'
     'end tell')
+
+
+def _deezer_app_running():
+    """Whether the Deezer app is running at all, regardless of MediaRemote.
+
+    MediaRemote only lists a player once it has played something, so a freshly
+    opened Deezer is invisible there. Without this, "Deezer is open but another
+    app holds the session" is indistinguishable from "Deezer is not running",
+    and the permission that would resolve it never gets asked for. Cached
+    because it costs a process spawn.
+    """
+    now = time.time()
+    with _proc_lock:
+        if _proc_cache["at"] > now - DEEZER_PROC_TTL:
+            return _proc_cache["val"]
+    try:
+        val = subprocess.run(["pgrep", "-x", "Deezer"],
+                             capture_output=True, timeout=3).returncode == 0
+    except Exception:
+        val = False
+    with _proc_lock:
+        _proc_cache.update(at=time.time(), val=val)
+    return val
+
+
+DEEZER_PROC_TTL = 5.0
+_proc_lock = threading.Lock()
+_proc_cache = {"at": 0.0, "val": False}
 
 
 def deezer_window_title():
